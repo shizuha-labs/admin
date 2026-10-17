@@ -1,0 +1,36 @@
+# Tooling note: generate/update uv.lock with uv 0.11.26; Docker pins the same uv version.
+# PLAT-1302: pyproject.toml + uv.lock are the single source of truth. The build
+# installs resolved, pinned versions via `uv sync --locked` so OSV/Trivy scan the
+# actually-deployed versions instead of resolving the old open `>=` ranges to the
+# range floor (the false-positive CVE flood PLAT-1302 identifies).
+[project]
+name = "shizuha-admin"
+version = "0.1.0"
+description = "Shizuha Admin service"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "Django>=5.2,<5.3",
+  "cryptography>=50.0.0",
+  "djangorestframework>=3.14.0",
+  "drf-nested-routers>=0.93.5",
+  "django-cors-headers>=4.3.0",
+  "psycopg2-binary>=2.9.9",
+  "djangorestframework-simplejwt>=5.3.0",
+  "PyJWT>=2.13.0",
+  "drf-spectacular>=0.27.0",
+  "celery>=5.3.0",
+  "redis>=5.0.0",
+  "django-celery-beat>=2.5.0",
+  "python-dotenv>=1.0.0",
+  "gunicorn>=21.2.0",
+  "requests>=2.31.0",
+  "mcp>=2.0.0",
+  "python-multipart>=0.0.32",
+]
+
+[tool.uv]
+package = false
+# PLAT-2050: dependency cooldown — ignore versions published in the last 7 days
+# (supply-chain hardening; a freshly-published malicious/broken release is not
+# resolved until it has been public a week).
+exclude-newer = "7 days"

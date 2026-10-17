@@ -1,0 +1,147 @@
+# ORIG-18: PR-gating test job — copy of deploy.yml's `authz-test-gate`, on
+# pull_request for branch-protection context `premerge / authz-test-gate (pull_request)`
+# (PLAT-4516). Keep in sync with deploy.yml.
+name: premerge
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  authz-test-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run Admin authz-invariant suite before deploy
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-test-shizuha-admin-${SHORT}"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-test, service: shizuha-admin, shizuha.io/ci-gate: PLAT-4200, shizuha.io/orig-task: ORIG-7 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        SOURCE_URL="\${GIT_SOURCE_URL:-}"
+                        SOURCE_SHA="\${GIT_SOURCE_SHA:-}"
+                        [ -n "\${SOURCE_URL}" ] && [ "\${SOURCE_URL}" != "<no value>" ] || SOURCE_URL="http://forgejo-http.origin.svc.cluster.local/shizuha-labs/admin.git"
+                        [ -n "\${SOURCE_SHA}" ] && [ "\${SOURCE_SHA}" != "<no value>" ] || SOURCE_SHA="${{ github.sha }}"
+                        case "\${SOURCE_URL}" in
+                          http://forgejo-http.origin.svc.cluster.local/*) AUTH_URL="http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/\${SOURCE_URL#http://forgejo-http.origin.svc.cluster.local/}" ;;
+                          https://origin.shizuha.com/*) AUTH_URL="http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/\${SOURCE_URL#https://origin.shizuha.com/}" ;;
+                          https://github.com/*) AUTH_URL="https://x-token-auth:\${GIT_PASSWORD}@github.com/\${SOURCE_URL#https://github.com/}" ;;
+                          *) AUTH_URL="\${SOURCE_URL}" ;;
+                        esac
+                        git init /workspace/src
+                        cd /workspace/src
+                        git remote add origin "\${AUTH_URL}"
+                        git fetch --depth=1 origin "\${SOURCE_SHA}"
+                        git checkout --detach FETCH_HEAD
+                        test "\$(git rev-parse HEAD)" = "\${SOURCE_SHA}"
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                      - name: GIT_SOURCE_URL
+                        value: "${{ github.event.pull_request.head.repo.clone_url }}"
+                      - name: GIT_SOURCE_SHA
+                        value: "${{ github.event.pull_request.head.sha }}"
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: test
+                    image: python:3.11-bookworm
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        export DEBIAN_FRONTEND=noninteractive
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 install -y --no-install-recommends postgresql redis-server build-essential libpq-dev
+                        pg_ctlcluster 15 main start
+                        su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres';\""
+                        su postgres -c "createdb shizuha_admin_ci" || true
+                        # HIVE-671: the admin app now uses a Redis CACHES
+                        # backend (fail-closed nonce claim); the authz suite
+                        # serializes memberships (get_display_name -> cache.get),
+                        # so the gate must provide Redis like it does Postgres.
+                        redis-server --daemonize yes
+                        redis-cli ping
+                        cd /workspace/src
+                        python -m pip install --index-url http://pip-cache.registry.svc.cluster.local/simple --trusted-host pip-cache.registry.svc.cluster.local --upgrade pip
+                        python -m pip install --index-url http://pip-cache.registry.svc.cluster.local/simple --trusted-host pip-cache.registry.svc.cluster.local uv==0.11.26
+                        uv sync --locked --no-dev --no-install-project
+                        export POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=shizuha_admin_ci
+                        export DEBUG=0 SECRET_KEY=ci-secret JWT_SECRET_KEY=ci-secret
+                        .venv/bin/python manage.py test \
+                          organizations.test_explicit_runtime_credentials \
+                          organizations.test_plat4200_authz_isolation \
+                          organizations.test_plat4200_internal_ingress_guard \
+                          organizations.test_plat4200_internal_service_auth \
+                          organizations.test_hive671_membership_revoke \
+                          organizations.test_hive671_agent_profile \
+                          organizations.test_hive671_membership_revoke_pg \
+                          organizations.test_hive671_dual_key_auth \
+                          organizations.test_jit_elevated_access \
+                          organizations.test_plat4927_member_services_listing \
+                          organizations.test_admin_overview_contracts \
+                          organizations.test_internal_project_memberships \
+                          organizations.test_plat8136_membership_v2 \
+                          organizations.test_organization_cache_policy \
+                          organizations.test_company_os_seed_configuration \
+                          --noinput
+                        .venv/bin/python scripts/test_plat4779_ledger_dedup.py
+                        (
+                          cd mcp-server
+                          SHIZUHA_ADMIN_URL=http://admin-ci.invalid \
+                            ../.venv/bin/python -m unittest \
+                              test_plat4927_org_service_member \
+                              test_plat5096_su_set_user_services
+                        )
+                    resources:
+                      requests: { memory: 2Gi, cpu: "1" }
+                      limits: { memory: 8Gi }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+
+          DEADLINE=$(( $(date +%s) + 1800 ))
+          while true; do
+            COMPLETE="$(kubectl get job -n build "${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+            FAILED="$(kubectl get job -n build "${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            [ "${COMPLETE}" = "True" ] && break
+            if [ "${FAILED}" = "True" ]; then
+              echo "::error::Admin authz-invariant test gate FAILED — suite output follows"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || true
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              echo "::error::Admin authz-invariant test gate timed out after 1800s"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || true
+              exit 1
+            fi
+            sleep 10
+          done
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=160 || true

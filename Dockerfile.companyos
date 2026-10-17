@@ -1,0 +1,5 @@
+# Overlay current admin main (company_os tool + org-resource + migrations 0009/0010) on the deployed base.
+# requirements unchanged since base -> deps already present. Build via gx10-1:30500 (insecure-registry).
+FROM gx10-1:30500/shizuha-admin:s260606a-eb56513
+WORKDIR /app
+COPY . /app/
