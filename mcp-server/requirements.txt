@@ -1,0 +1,12 @@
+# Shizuha MCP Server Dependencies
+mcp>=1.28.1,<2.0.0  # security floor: highest fixed across all 12 PyPI/mcp advisories; <2.0.0 because 2.x removed mcp.server.fastmcp
+             # 1.28.1 = GHSA-vj7q-gjh5-988w (WebSocket Host validation).
+             # NB 1.23.0 is the *introduced* version of GHSA-hvrp-rf83-w775
+             # (fixed 1.27.2), so a 1.23.0 floor permits a newly-vulnerable
+             # resolution; also covers GHSA-jpw9-pfvf-9f58 (1.27.2),
+             # GHSA-9h52-p55h-vw2f (1.23.0), GHSA-j975-95f5-7wqh (1.10.0),
+             # GHSA-3qhf-m339-9g5v (1.9.4).
+python-multipart>=0.0.32
+requests>=2.28.0
+PyJWT>=2.13.0
+idna>=3.15

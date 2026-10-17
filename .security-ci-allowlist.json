@@ -1,0 +1,12 @@
+{
+  "_comment": "security-ci suppressions. Each entry matches a finding by any of: source_id, tool, rule, path_contains. `source_id`, `tool` and `rule` match EXACTLY; only `path_contains` is a substring test (scripts/security-ci-to-pulse.py::allowlisted). Every entry MUST carry owner + reason. Only accepted false positives belong here.",
+  "allowlist": [
+    {
+      "tool": "semgrep",
+      "rule": "python.jwt.security.jwt-hardcode.jwt-python-hardcoded-secret",
+      "path_contains": "mcp-server/test_token_verifier.py",
+      "owner": "engineering",
+      "reason": "Accepted false positive (PLAT-4687). The flagged literal is the shared secret in `test_hs256_shared_secret_token_is_rejected`, which builds an HS256 token ONLY to assert the verifier refuses it -- read at the scanned commit d0225624, mcp-server/test_token_verifier.py:28-37, where the assertion is `self.assertIsNone(result)`. The literal therefore authenticates nothing: it is the input to a negative test proving symmetric-key tokens cannot forge a session. It is not a credential for any system, is test-only (referenced solely by .forgejo/workflows/deploy.yml as a test target), and removing it would delete the regression that keeps HS256 rejection covered. Precedent: security@shizuha.com adjudicated the identical rule on the identical filename in shizuha-labs/shizuha-tasks. Two matching notes, both verified against scripts/security-ci-to-pulse.py::allowlisted rather than assumed: (1) `rule` is compared EXACTLY and security-ci records the full semgrep check_id (`rule=str(r.get(\"check_id\"))`), so an abbreviated rule name never matches; (2) `source_id` is deliberately OMITTED -- it is a content hash over the finding, so pinning it would make this suppression silently lapse the moment the message text or line number shifts."
+    }
+  ]
+}
