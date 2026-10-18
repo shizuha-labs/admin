@@ -25,6 +25,18 @@ commit them. The optional Connect security-event producer requires its URL and
 origin secret. Kubernetes JIT dispatch requires a configured `ORIGIN_API_URL`
 and dedicated dispatch credential.
 
+For `kubernetes.rbac.apply`, omitting `selected_fragment` (or using an empty
+string or `all`) preserves the complete-bundle contract. The only supported
+subset is `infra-recovery-owner-read`; request it on both grant admission and
+consumption. It is bound to the approved target constraints, consumed request
+digest, and Origin dispatch. A consumed complete-bundle use cannot be relabelled
+as a subset or replayed with a different selector. Native deployment rolls the
+existing Helm-owned API, Celery worker, and beat from the same verified multi-arch
+image. Worker and beat source/ownership converge before the API accepts new
+inputs; the final gate checks all three against captured owner UIDs and the
+checked-out application source. It never creates these Deployments.
+
+
 Set `SYSTEM_HEALTH_SERVICES` to a JSON list of the services actually installed,
 with `name`, `url`, and optional `enabled`/`optional` fields. Set `REDIS_HOST` for
 the infrastructure health view. Localhost endpoints are development defaults.

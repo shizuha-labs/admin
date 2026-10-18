@@ -556,6 +556,14 @@ class JITElevatedAccessGrantView(APIView):
                         status=status.HTTP_400_BAD_REQUEST,
                     )
                 constraints = {**exact_policy['fixed_constraints'], 'commit_sha': commit_sha}
+                try:
+                    selected = JITElevatedAccessGrant.normalize_kubernetes_selected_fragment(
+                        request.data.get('selected_fragment', ''),
+                    )
+                except ValueError as exc:
+                    return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                if selected:
+                    constraints['selected_fragment'] = selected
             else:  # registry presence plus missing adapter is an invariant fault
                 return Response({'error': 'Exact JIT scope has no admission adapter'}, status=status.HTTP_409_CONFLICT)
             exact_values.update({
@@ -878,7 +886,15 @@ class KubernetesJITConsumeView(APIView):
             return Response({'error': 'Unsupported Kubernetes JIT action'}, status=status.HTTP_400_BAD_REQUEST)
         if not re.fullmatch(r'[0-9a-f]{40}', expected_sha):
             return Response({'error': 'expected_sha must be a full commit SHA'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            selected = JITElevatedAccessGrant.normalize_kubernetes_selected_fragment(
+                request.data.get('selected_fragment', ''),
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         canonical_request = {'action': action, 'expected_sha': expected_sha}
+        if selected:
+            canonical_request['selected_fragment'] = selected
         request_digest = JITElevatedAccessGrant.constraint_digest_for(canonical_request)
 
         with transaction.atomic():
@@ -925,6 +941,8 @@ class KubernetesJITConsumeView(APIView):
             constraints = grant.target_constraints
             if expected_sha != constraints.get('commit_sha'):
                 return Response({'error': 'Grant target constraints do not match'}, status=status.HTTP_403_FORBIDDEN)
+            if selected != constraints.get('selected_fragment', ''):
+                return Response({'error': 'Grant selected fragment does not match'}, status=status.HTTP_403_FORBIDDEN)
 
             consumed_at = timezone.now()
             use = JITElevatedAccessGrantUse.objects.create(
@@ -940,6 +958,8 @@ class KubernetesJITConsumeView(APIView):
                 'expected_sha': expected_sha,
                 'dispatch_status': 'pending',
             }
+            if selected:
+                result['selected_fragment'] = selected
             use.result = result
             use.save(update_fields=['result'])
             JITElevatedAccessGrant.objects.filter(pk=grant.pk).update(

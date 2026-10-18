@@ -139,6 +139,8 @@ jobs:
                           organizations.test_hive671_membership_revoke_pg \
                           organizations.test_hive671_dual_key_auth \
                           organizations.test_jit_elevated_access \
+                          organizations.test_jit_selected_fragment \
+                          organizations.test_release_owner \
                           organizations.test_plat4927_member_services_listing \
                           organizations.test_admin_overview_contracts \
                           organizations.test_internal_project_memberships \
@@ -448,6 +450,7 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@v4
       - name: Install kubectl + cluster access
         run: |
           set -euo pipefail
@@ -460,9 +463,12 @@ jobs:
       - name: Deploy multi-arch image + verify
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
           SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
           TAG="admin-${SHORT}"
           REG="registry.registry.svc.cluster.local:5000"
+          # Source-bound preflight captures the three existing Helm owner UIDs.
+          OWNERS="$(python3 .forgejo/scripts/verify-admin-release.py --source-sha "${{ github.sha }}" --image "localhost:30500/shizuha-admin:${TAG}" --phase preflight)"
           PREV="$(kubectl get deploy -n shizuha shizuha-admin -o jsonpath='{.spec.template.spec.containers[?(@.name=="shizuha-admin")].image}' 2>/dev/null || true)"
           if [ -n "${PREV}" ]; then
             echo "Current image: ${PREV}"
@@ -477,6 +483,12 @@ jobs:
               echo "::error::Hive membership signing key is not provisioned"
               exit 1
             }
+          # Upgrade and prove compatible outbox consumers before exposing new API inputs.
+          kubectl set image -n shizuha deployment/shizuha-admin-worker worker="localhost:30500/shizuha-admin:${TAG}"
+          kubectl set image -n shizuha deployment/shizuha-admin-beat beat="localhost:30500/shizuha-admin:${TAG}"
+          kubectl rollout status -n shizuha deployment/shizuha-admin-worker --timeout=300s
+          kubectl rollout status -n shizuha deployment/shizuha-admin-beat --timeout=300s
+          python3 .forgejo/scripts/verify-admin-release.py --source-sha "${{ github.sha }}" --image "localhost:30500/shizuha-admin:${TAG}" --phase consumers --expected-owners "$OWNERS"
           kubectl -n shizuha patch deployment shizuha-admin --type=strategic --patch "$(cat <<JSON
           {"spec":{"template":{"spec":{"containers":[{"name":"shizuha-admin","image":"localhost:30500/shizuha-admin:${TAG}","env":[{"name":"SHIZUHA_REVOCATION_STATUS_URL","value":"http://shizuha-id.shizuha.svc.cluster.local.:8001/api/oauth/revocation-status"},{"name":"HIVE_SERVICE_SIGNING_KEY","value":null,"valueFrom":{"secretKeyRef":{"name":"hive-service-signing-key","key":"key","optional":true}}}]}]}}}}
           JSON
@@ -502,3 +514,5 @@ jobs:
             exit 1
           fi
           echo "OK schema converged — no unapplied migrations"
+
+          python3 .forgejo/scripts/verify-admin-release.py --source-sha "${{ github.sha }}" --image "localhost:30500/shizuha-admin:${TAG}" --expected-owners "$OWNERS"
