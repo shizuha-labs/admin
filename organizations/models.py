@@ -339,6 +339,18 @@ class JITElevatedAccessGrant(models.Model):
     # fails closed without turning the snapshot into executable authority.
     TEAM_MEMBER_ADD_SCOPE = 'org.teams.members.add'
     KUBERNETES_RBAC_APPLY_SCOPE = 'kubernetes.rbac.apply'
+    KUBERNETES_SELECTED_FRAGMENT = 'infra-recovery-owner-read'
+
+    @classmethod
+    def normalize_kubernetes_selected_fragment(cls, value):
+        """Keep the historical all contract unchanged; allow one fixed subset."""
+        if not isinstance(value, str):
+            raise ValueError('selected_fragment must be all or infra-recovery-owner-read')
+        if value in ('', 'all'):
+            return ''
+        if value == cls.KUBERNETES_SELECTED_FRAGMENT:
+            return value
+        raise ValueError('selected_fragment must be all or infra-recovery-owner-read')
     EXACT_SCOPE_POLICIES = {
         TEAM_MEMBER_ADD_SCOPE: {
             'key': 'admin.team-roster.member-add',
@@ -503,6 +515,10 @@ class JITElevatedAccessGrant(models.Model):
         if self.constraint_digest != self.constraint_digest_for(self.target_constraints):
             return False
         expected_fields = set(policy['target_fields'])
+        if self.scope == self.KUBERNETES_RBAC_APPLY_SCOPE and 'selected_fragment' in self.target_constraints:
+            if self.target_constraints['selected_fragment'] != self.KUBERNETES_SELECTED_FRAGMENT:
+                return False
+            expected_fields.add('selected_fragment')
         if set(self.target_constraints) != expected_fields:
             return False
         fixed = policy.get('fixed_constraints') or {}

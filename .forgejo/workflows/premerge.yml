@@ -105,6 +105,8 @@ jobs:
                           organizations.test_hive671_membership_revoke_pg \
                           organizations.test_hive671_dual_key_auth \
                           organizations.test_jit_elevated_access \
+                          organizations.test_jit_selected_fragment \
+                          organizations.test_release_owner \
                           organizations.test_plat4927_member_services_listing \
                           organizations.test_admin_overview_contracts \
                           organizations.test_internal_project_memberships \

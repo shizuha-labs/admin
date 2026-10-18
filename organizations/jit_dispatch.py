@@ -32,6 +32,36 @@ def _dispatch_request(use):
     }
     if any(constraints.get(key) != value for key, value in expected.items()):
         raise RuntimeError('stored Kubernetes JIT dispatch contract is not allowlisted')
+    try:
+        selected = grant.normalize_kubernetes_selected_fragment(
+            constraints.get('selected_fragment', ''),
+        )
+    except ValueError as exc:
+        raise RuntimeError('stored Kubernetes JIT fragment is not allowlisted') from exc
+    if 'selected_fragment' in constraints and selected != grant.KUBERNETES_SELECTED_FRAGMENT:
+        raise RuntimeError('stored Kubernetes JIT fragment is not canonical')
+    selected_request = {
+        'action': 'apply-origin-ci-deployer-rbac',
+        'expected_sha': constraints['commit_sha'],
+        'selected_fragment': grant.KUBERNETES_SELECTED_FRAGMENT,
+    }
+    if not selected and (
+        'selected_fragment' in use.result
+        or use.request_digest == grant.constraint_digest_for(selected_request)
+    ):
+        raise RuntimeError('selected Kubernetes JIT use cannot dispatch the complete bundle')
+    if selected:
+        canonical_request = selected_request
+        expected_result = {
+            'grant_id': grant.pk, 'use_id': use.pk, 'task_key': grant.task_key,
+            **canonical_request,
+        }
+        if (
+            not grant.has_complete_current_exact_authority()
+            or use.request_digest != grant.constraint_digest_for(canonical_request)
+            or any(use.result.get(key) != value for key, value in expected_result.items())
+        ):
+            raise RuntimeError('selected Kubernetes JIT use is not bound to its grant')
     url = (
         settings.ORIGIN_API_URL.rstrip('/')
         + '/api/v1/repos/shizuha-labs/deploy/actions/workflows/'
@@ -47,6 +77,8 @@ def _dispatch_request(use):
             'task_key': grant.task_key,
         },
     }
+    if selected:
+        payload['inputs']['selected_fragment'] = selected
     return urllib.request.Request(
         url,
         data=json.dumps(payload, sort_keys=True).encode('utf-8'),
