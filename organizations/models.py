@@ -339,6 +339,7 @@ class JITElevatedAccessGrant(models.Model):
     # fails closed without turning the snapshot into executable authority.
     TEAM_MEMBER_ADD_SCOPE = 'org.teams.members.add'
     KUBERNETES_RBAC_APPLY_SCOPE = 'kubernetes.rbac.apply'
+    ORIGIN_REPOSITORY_MERGE_SCOPE = 'origin.repository.merge'
     KUBERNETES_SELECTED_FRAGMENT = 'infra-recovery-owner-read'
 
     @classmethod
@@ -380,6 +381,16 @@ class JITElevatedAccessGrant(models.Model):
                 'namespace_envelope': ['origin', 'shizuha', 'shizuha-fleet', 'registry'],
                 'resource_envelope': ['rbac.authorization.k8s.io'],
             },
+        },
+        # PLS-1350: merge clicks are devops-owned, one-use, and never auto-approved.
+        ORIGIN_REPOSITORY_MERGE_SCOPE: {
+            'key': 'origin.repository.merge',
+            'version': 1,
+            'enabled': True,
+            'approver_team_name': 'DevOps',
+            'max_ttl_seconds': 3600,
+            'max_uses': 1,
+            'target_fields': ['repository', 'pr_number'],
         },
     }
 

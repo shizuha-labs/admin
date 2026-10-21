@@ -548,6 +548,26 @@ class JITElevatedAccessGrantView(APIView):
                     'target_user_id': target_user_id,
                     'target_role': target_role,
                 })
+            elif scope == JITElevatedAccessGrant.ORIGIN_REPOSITORY_MERGE_SCOPE:
+                repository = (request.data.get('repository') or '').strip()
+                if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+                    return Response(
+                        {'error': 'repository must be owner/name'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    pr_number = int(request.data.get('pr_number') or request.data.get('pull_request'))
+                except (TypeError, ValueError):
+                    return Response(
+                        {'error': 'pr_number is required'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if pr_number <= 0:
+                    return Response(
+                        {'error': 'pr_number must be a positive integer'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                constraints = {'repository': repository, 'pr_number': pr_number}
             elif scope == JITElevatedAccessGrant.KUBERNETES_RBAC_APPLY_SCOPE:
                 commit_sha = (request.data.get('commit_sha') or '').strip().lower()
                 if not re.fullmatch(r'[0-9a-f]{40}', commit_sha):

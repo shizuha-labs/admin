@@ -1028,6 +1028,53 @@ class JITElevatedAccessGrantTests(TestCase):
         grant.refresh_from_db()
         self.assertEqual(grant.uses_consumed, 1)
 
+    def test_pls1350_merge_scope_is_visible_to_devops_peer_not_requester_decision(self):
+        OrganizationMembership.objects.create(
+            organization=self.org, user_id=20, user_email='req-merge@shizuha.com',
+            role='member', is_pending=False,
+        )
+        OrganizationMembership.objects.create(
+            organization=self.org, user_id=21, user_email='devops-peer@shizuha.com',
+            role='member', is_pending=False,
+        )
+        devops = Team.objects.create(organization=self.org, name='DevOps')
+        peer = EmployeeProfile.objects.get(
+            membership__organization=self.org, membership__user_id=21,
+        )
+        TeamMembership.objects.create(team=devops, employee_profile=peer, role='member')
+
+        self._auth(user_id=20, email='req-merge@shizuha.com')
+        requested = self.client.post('/api/jit-elevations/', {
+            'org_slug': self.org.slug,
+            'scope': JITElevatedAccessGrant.ORIGIN_REPOSITORY_MERGE_SCOPE,
+            'reason': 'PLS-1350 merge rung',
+            'task_key': 'PLS-1350',
+            'ttl_seconds': 3600,
+            'owning_team': 'devops',
+            'repository': 'shizuha-labs/pulse',
+            'pr_number': 792,
+        }, format='json')
+        self.assertEqual(requested.status_code, status.HTTP_201_CREATED, requested.data)
+        grant = JITElevatedAccessGrant.objects.get(pk=requested.data['grant']['id'])
+        self.assertEqual(grant.approver_team, devops)
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_PENDING)
+        self.assertEqual(grant.target_constraints['repository'], 'shizuha-labs/pulse')
+        self.assertEqual(grant.target_constraints['pr_number'], 792)
+        self.assertNotIn(grant.scope, JITElevatedAccessGrant.LOW_RISK_AUTO_SCOPES)
+
+        self_decision = self.client.post(
+            f'/api/jit-elevations/{grant.pk}/approve/',
+            {'note': 'requester must not self-approve'},
+            format='json',
+        )
+        self.assertEqual(self_decision.status_code, status.HTTP_403_FORBIDDEN)
+
+        self._auth(user_id=21, email='devops-peer@shizuha.com')
+        listed = self.client.get('/api/jit-elevations/', {'status': 'pending'})
+        self.assertEqual([row['id'] for row in listed.data['results']], [grant.id])
+        fetched = self.client.get(f'/api/jit-elevations/{grant.pk}/')
+        self.assertEqual(fetched.status_code, status.HTTP_200_OK)
+
     def test_plat5042_uncited_grant_message_and_sod_self_decision(self):
         """Bare call names the uncited grant; requester still cannot self-approve.
 
