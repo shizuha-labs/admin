@@ -6,7 +6,7 @@ from datetime import timedelta
 import hashlib
 import json
 
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -291,12 +291,19 @@ class JITElevatedAccessGrant(models.Model):
     STATUS_APPROVED = 'approved'
     STATUS_DENIED = 'denied'
     STATUS_REVOKED = 'revoked'
+    # ORIG-412: a consumed single-use grant is NOT revoked until its dispatch
+    # is accepted. In this state the approval is parked: no further consume is
+    # possible, the use row is being dispatched, and on window expiry without
+    # acceptance the approval is explicitly released instead of silently
+    # revoked-with-no-run.
+    STATUS_PENDING_DISPATCH = 'pending_dispatch'
 
     STATUS_CHOICES = [
         (STATUS_PENDING, 'Pending'),
         (STATUS_APPROVED, 'Approved'),
         (STATUS_DENIED, 'Denied'),
         (STATUS_REVOKED, 'Revoked'),
+        (STATUS_PENDING_DISPATCH, 'Consumed, pending dispatch'),
     ]
 
     APPROVAL_POLICY = 'policy'
@@ -676,6 +683,69 @@ class JITElevatedAccessGrant(models.Model):
             'status', 'decided_by_user_id', 'decided_by_email',
             'decision_note', 'revoked_at', 'updated_at'
         ])
+
+    @classmethod
+    def release_expired_pending_dispatch_consumes(cls, *, batch_size=100):
+        """ORIG-412: expiry without an accepted dispatch must never leave a
+        single-use grant revoked-with-no-run.
+
+        For every ``pending_dispatch`` grant whose window has passed:
+        - a belt-and-braces burn applies when a use WAS accepted (acceptance
+          already burns; this catches a missed burn rather than releasing
+          exercised authority);
+        - otherwise the dead uses are marked ``released`` (evidence kept,
+          reconcile skips them), the approval is explicitly released back to
+          the pending queue for re-approval/re-filing, and the use counter is
+          decremented so a dead hop cannot exhaust ``max_uses``.
+
+        Returns the list of affected grant ids.
+        """
+        affected = []
+        grants = list(
+            cls.objects.filter(
+                status=cls.STATUS_PENDING_DISPATCH,
+                expires_at__isnull=False,
+                expires_at__lte=timezone.now(),
+            ).order_by('id').values_list('pk', flat=True)[:batch_size]
+        )
+        for grant_id in grants:
+            with transaction.atomic():
+                grant = cls.objects.select_for_update().get(pk=grant_id)
+                accepted = grant.uses.filter(dispatch_status='accepted').exists()
+                now = timezone.now()
+                if accepted:
+                    cls.objects.filter(pk=grant.pk).update(
+                        status=cls.STATUS_REVOKED, revoked_at=now, updated_at=now,
+                    )
+                    JITElevatedAccessGrantEvent.objects.create(
+                        grant=grant, event_type='auto_revoked', source='origin',
+                        detail={
+                            'reason': 'dispatch_accepted_burn_reconciled',
+                            'post_acceptance': True,
+                        },
+                    )
+                    affected.append(grant.pk)
+                    continue
+                released = grant.uses.filter(
+                    dispatch_status__in=['pending', 'failed'],
+                    origin_run_id__isnull=True,
+                ).update(dispatch_status='released', completed_at=now)
+                cls.objects.filter(pk=grant.pk).update(
+                    status=cls.STATUS_PENDING,
+                    uses_consumed=max(0, grant.uses_consumed - released),
+                    updated_at=now,
+                )
+                JITElevatedAccessGrantEvent.objects.create(
+                    grant=grant, event_type='dispatch_window_expired_released',
+                    source='origin', actor_user_id=grant.requester_user_id,
+                    actor_email=grant.requester_email,
+                    detail={
+                        'released_uses': released,
+                        'note': 'approval released for re-filing; grant never revoked-with-no-run',
+                    },
+                )
+                affected.append(grant.pk)
+        return affected
 
 
 class JITElevatedAccessGrantEvent(models.Model):

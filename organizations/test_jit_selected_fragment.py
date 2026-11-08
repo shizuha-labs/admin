@@ -94,7 +94,9 @@ class KubernetesSelectedFragmentTests(TestCase):
         })
         grant.refresh_from_db()
         self.assertEqual(grant.uses_consumed, 1)
-        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_REVOKED)
+        # ORIG-412: consume parks the approval; the burn is post-acceptance.
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_PENDING_DISPATCH)
+        self.assertIsNone(grant.revoked_at)
         replay = self.consume(grant, SELECTED)
         self.assertEqual(replay.status_code, 202)
         self.assertEqual(replay.data['use_id'], use.pk)

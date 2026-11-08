@@ -1054,24 +1054,24 @@ class KubernetesJITConsumeView(APIView):
             use.save(update_fields=['result'])
             JITElevatedAccessGrant.objects.filter(pk=grant.pk).update(
                 uses_consumed=grant.uses_consumed + 1,
-                status=JITElevatedAccessGrant.STATUS_REVOKED,
-                revoked_at=consumed_at,
+                # ORIG-412: burn happens post-acceptance, not here. Park the
+                # approval so a dispatch failing until window expiry releases
+                # the approval instead of revoking-with-no-run.
+                status=JITElevatedAccessGrant.STATUS_PENDING_DISPATCH,
                 updated_at=consumed_at,
             )
             grant.uses_consumed += 1
-            grant.status = JITElevatedAccessGrant.STATUS_REVOKED
-            grant.revoked_at = consumed_at
+            grant.status = JITElevatedAccessGrant.STATUS_PENDING_DISPATCH
             _audit_jit(
                 grant, 'consumed', request,
                 detail={
                     'use_id': use.pk,
                     'constraint_digest': grant.constraint_digest,
                     'idempotency_key_digest': JITElevatedAccessGrant._canonical_digest(idempotency_key),
-                    'auto_revoked': True,
+                    'burn_on': 'dispatch_accepted',
                 },
             )
             _audit_jit(grant, 'dispatch_queued', request, detail={'use_id': use.pk})
-            _audit_jit(grant, 'auto_revoked', request, detail={'use_id': use.pk})
 
             from .tasks import dispatch_kubernetes_jit_use_task
             transaction.on_commit(lambda: dispatch_kubernetes_jit_use_task.delay(use.pk))
