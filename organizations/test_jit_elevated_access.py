@@ -348,6 +348,21 @@ class JITElevatedAccessGrantTests(TestCase):
             )
         self.assertEqual(invite_response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_pls1350_unregistered_scope_does_not_mint_legacy_grant(self):
+        self._auth()
+        response = self.client.post('/api/jit-elevations/', {
+            'org_slug': self.org.slug,
+            'scope': 'origin.repository.force_push',
+            'reason': 'PLS-1350 unregistered scope must not mint a legacy grant',
+            'task_key': 'PLS-1350',
+            'ttl_seconds': 1800,
+            'owning_team': 'devops',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertEqual(response.data['code'], 'jit_scope_unregistered')
+        self.assertIn('origin.repository.merge', response.data['registered_scopes'])
+        self.assertFalse(JITElevatedAccessGrant.objects.exists())
+
     def test_high_risk_owner_request_is_pending_for_owning_team_not_operator(self):
         self._auth()
         response = self.client.post('/api/jit-elevations/', {

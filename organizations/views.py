@@ -456,6 +456,25 @@ class JITElevatedAccessGrantView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        # PLS-1350: a scope with no exact policy and no low-risk auto policy
+        # used to mint a pending grant on the legacy admin_org_ids visibility
+        # path. Approver-team members then 404'd (grant #665). Refuse it.
+        # org.members.owner_transfer stays admissible: it is an intentional
+        # owning-team pending scope, not an unregistered stray.
+        admitted = (
+            exact_policy is not None
+            or scope in JITElevatedAccessGrant.LOW_RISK_AUTO_SCOPES
+            or scope == 'org.members.owner_transfer'
+        )
+        if not admitted:
+            return Response(
+                {
+                    'error': 'JIT scope is not registered',
+                    'code': 'jit_scope_unregistered',
+                    'registered_scopes': sorted(JITElevatedAccessGrant.EXACT_SCOPE_POLICIES),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         exact_values = {}
         if exact_policy:
             if not exact_policy.get('enabled'):
