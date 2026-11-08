@@ -248,7 +248,9 @@ class JITElevatedAccessGrantTests(TestCase):
         use = JITElevatedAccessGrantUse.objects.get(grant=grant)
         dispatch.assert_called_once_with(use.pk)
         grant.refresh_from_db()
-        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_REVOKED)
+        # ORIG-412: consume parks the approval; the burn is post-acceptance.
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_PENDING_DISPATCH)
+        self.assertIsNone(grant.revoked_at)
         self.assertEqual(grant.uses_consumed, 1)
         self.assertEqual(use.dispatch_status, 'pending')
 

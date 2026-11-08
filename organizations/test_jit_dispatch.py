@@ -102,3 +102,86 @@ class KubernetesJITDispatchTests(TestCase):
         dispatch.return_value = {'use_id': use.pk}
         self.assertEqual(reconcile_pending_kubernetes_jit_uses(), [{'use_id': use.pk}])
         dispatch.assert_called_once_with(use.pk)
+
+    # ORIG-412: burn moves post-acceptance.
+    def _consume_shape_grant(self, **overrides):
+        org = Organization.objects.create(name='Acme2', slug='acme2', owner_id=1)
+        policy = JITElevatedAccessGrant.exact_policy_for_scope(
+            JITElevatedAccessGrant.KUBERNETES_RBAC_APPLY_SCOPE
+        )
+        constraints = {**policy['fixed_constraints'], 'commit_sha': 'b' * 40}
+        fields = dict(
+            organization=org, requester_user_id=10,
+            requester_email='requester@shizuha.com',
+            scope=JITElevatedAccessGrant.KUBERNETES_RBAC_APPLY_SCOPE,
+            requested_role='admin', reason='test', task_key='PLAT-6167',
+            status=JITElevatedAccessGrant.STATUS_PENDING_DISPATCH,
+            target_constraints=constraints,
+            constraint_digest=JITElevatedAccessGrant.constraint_digest_for(constraints),
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+        fields.update(overrides)
+        return JITElevatedAccessGrant.objects.create(**fields)
+
+    @patch('organizations.jit_dispatch.urllib.request.urlopen', return_value=_Response())
+    def test_acceptance_burns_grant_post_acceptance(self, urlopen):
+        grant = self._consume_shape_grant()
+        use = JITElevatedAccessGrantUse.objects.create(
+            grant=grant, idempotency_key='burn-after-accept',
+            request_digest='d' * 64, actor_user_id=10,
+            actor_email='requester@shizuha.com',
+        )
+        self.assertEqual(grant.revoked_at, None)
+        dispatch_kubernetes_jit_use(use.pk)
+        grant.refresh_from_db()
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_REVOKED)
+        self.assertIsNotNone(grant.revoked_at)
+        self.assertTrue(grant.uses.filter(dispatch_status='accepted').exists())
+
+    @patch('organizations.jit_dispatch.urllib.request.urlopen', return_value=_Response())
+    def test_parked_pending_dispatch_grant_is_not_revoked_before_acceptance(self, urlopen):
+        grant = self._consume_shape_grant()
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_PENDING_DISPATCH)
+        self.assertEqual(grant.revoked_at, None)
+        self.assertTrue(grant.is_active_now() is False)  # parked: not consumable, not revoked
+
+    def test_window_expiry_without_acceptance_releases_approval(self):
+        grant = self._consume_shape_grant(expires_at=timezone.now() - timedelta(seconds=1))
+        dead = JITElevatedAccessGrantUse.objects.create(
+            grant=grant, idempotency_key='dead-hop',
+            request_digest='d' * 64, actor_user_id=10,
+            actor_email='requester@shizuha.com', dispatch_status='failed',
+            last_dispatch_error='[Errno 111] Connection refused',
+        )
+        affected = JITElevatedAccessGrant.release_expired_pending_dispatch_consumes()
+        self.assertIn(grant.pk, affected)
+        grant.refresh_from_db()
+        dead.refresh_from_db()
+        # Explicit release — never revoked-with-no-run.
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_PENDING)
+        self.assertEqual(grant.revoked_at, None)
+        self.assertEqual(grant.uses_consumed, 0)
+        self.assertEqual(dead.dispatch_status, 'released')
+
+    def test_window_expiry_with_accepted_use_burns_instead(self):
+        grant = self._consume_shape_grant(expires_at=timezone.now() - timedelta(seconds=1))
+        JITElevatedAccessGrantUse.objects.create(
+            grant=grant, idempotency_key='accepted-late',
+            request_digest='d' * 64, actor_user_id=10, dispatch_status='accepted',
+            origin_run_id=99, dispatched_at=timezone.now(),
+        )
+        affected = JITElevatedAccessGrant.release_expired_pending_dispatch_consumes()
+        self.assertIn(grant.pk, affected)
+        grant.refresh_from_db()
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_REVOKED)
+        self.assertIsNotNone(grant.revoked_at)
+
+    @patch('organizations.jit_dispatch.dispatch_kubernetes_jit_use_fail_loud')
+    def test_reconciler_skips_released_uses(self, dispatch):
+        grant = self._consume_shape_grant()
+        JITElevatedAccessGrantUse.objects.create(
+            grant=grant, idempotency_key='released-evidence',
+            request_digest='d' * 64, actor_user_id=10, dispatch_status='released',
+        )
+        self.assertEqual(reconcile_pending_kubernetes_jit_uses(), [])
+        dispatch.assert_not_called()

@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from .models import (
@@ -124,19 +125,35 @@ def dispatch_kubernetes_jit_use(use_id):
         'origin_run_number': run_number,
     }
     now = timezone.now()
-    JITElevatedAccessGrantUse.objects.filter(pk=use.pk).update(
-        dispatch_status='accepted', dispatch_attempts=use.dispatch_attempts + 1,
-        origin_run_id=run_id, origin_run_number=run_number,
-        last_dispatch_error='', dispatched_at=now, result=result,
-    )
-    JITElevatedAccessGrantEvent.objects.create(
-        grant=use.grant,
-        event_type='dispatch_accepted',
-        actor_user_id=use.actor_user_id,
-        actor_email=use.actor_email,
-        source='origin',
-        detail={'use_id': use.pk, 'origin_run_id': run_id, 'origin_run_number': run_number},
-    )
+    with transaction.atomic():
+        JITElevatedAccessGrantUse.objects.filter(pk=use.pk).update(
+            dispatch_status='accepted', dispatch_attempts=use.dispatch_attempts + 1,
+            origin_run_id=run_id, origin_run_number=run_number,
+            last_dispatch_error='', dispatched_at=now, result=result,
+        )
+        JITElevatedAccessGrantEvent.objects.create(
+            grant=use.grant,
+            event_type='dispatch_accepted',
+            actor_user_id=use.actor_user_id,
+            actor_email=use.actor_email,
+            source='origin',
+            detail={'use_id': use.pk, 'origin_run_id': run_id, 'origin_run_number': run_number},
+        )
+        # ORIG-412: the single-use burn moves HERE — post-acceptance. The
+        # consume commit parks the approval in ``pending_dispatch``; revoking
+        # at consume-commit time could burn a grant whose dispatch never
+        # lands (the PLAT-12245 dead-hop class).
+        JITElevatedAccessGrant.objects.filter(
+            pk=use.grant.pk, status=JITElevatedAccessGrant.STATUS_PENDING_DISPATCH,
+        ).update(
+            status=JITElevatedAccessGrant.STATUS_REVOKED,
+            revoked_at=now, updated_at=now,
+        )
+        JITElevatedAccessGrantEvent.objects.create(
+            grant=use.grant, event_type='auto_revoked', source='origin',
+            actor_user_id=use.actor_user_id, actor_email=use.actor_email,
+            detail={'use_id': use.pk, 'reason': 'dispatch_accepted_burn', 'post_acceptance': True},
+        )
     return result
 
 
@@ -171,3 +188,10 @@ def reconcile_pending_kubernetes_jit_uses():
         ).order_by('created_at').values_list('pk', flat=True)[:100]
     )
     return [dispatch_kubernetes_jit_use_fail_loud(use_id) for use_id in use_ids]
+
+
+def release_expired_kubernetes_jit_consumes():
+    """ORIG-412: explicit release for grants whose window expired without an
+    accepted dispatch — never revoked-with-no-run. Runs in the same periodic
+    reconcile family as :func:`reconcile_pending_kubernetes_jit_uses`."""
+    return JITElevatedAccessGrant.release_expired_pending_dispatch_consumes()
