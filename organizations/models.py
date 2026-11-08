@@ -394,6 +394,18 @@ class JITElevatedAccessGrant(models.Model):
         },
     }
 
+    # PLAT-7343: legacy (non-exact) scopes whose approval is delegated to a
+    # named team. These scopes are not target-constrained like the exact-policy
+    # scopes (e.g. kubernetes RBAC apply targets a namespace, not a roster
+    # team/user), so they cannot ride the EXACT_SCOPE_POLICIES contract. This
+    # mapping is the durable scope -> approver-team record: a lead/member of the
+    # named team (other than the requester — SoD) may approve/deny/revoke grants
+    # in these scopes. The requester must never be the sole approver.
+    APPROVER_TEAM_BY_SCOPE = {
+        'kubernetes.rbac.apply': 'Platform',
+        'kubernetes.ci_deployer_rbac.apply': 'Platform',
+    }
+
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
@@ -473,6 +485,34 @@ class JITElevatedAccessGrant(models.Model):
     def exact_policy_for_scope(cls, scope):
         policy = cls.EXACT_SCOPE_POLICIES.get(scope)
         return dict(policy) if policy else None
+
+    @classmethod
+    def approver_team_name_for_scope(cls, scope):
+        """PLAT-7343: named approver team for a legacy scope, or None."""
+        return cls.APPROVER_TEAM_BY_SCOPE.get(scope)
+
+    def resolved_approver_team(self):
+        """PLAT-7343: resolve the live approver Team for a legacy-scope grant.
+
+        Returns the active Team whose name matches the scope's mapped approver
+        team (for the grant's organization), or None when the scope has no
+        mapped approver team or the team is not uniquely/actively resolvable.
+        """
+        team_name = self.approver_team_name_for_scope(self.scope)
+        if not team_name:
+            return None
+        matching = Team.objects.filter(
+            organization=self.organization,
+            name__iexact=team_name,
+            is_active=True,
+        )
+        # PLAT-7343 P2a (rui 10-22): the docstring promises a uniquely/actively
+        # resolvable team, but `.first()` silently picked an arbitrary team when
+        # duplicate active teams share the mapped name. Fail closed instead:
+        # no single unambiguous approver team ⇒ no mapped-approver authority.
+        if matching.count() != 1:
+            return None
+        return matching.get()
 
     @staticmethod
     def _canonical_digest(value):

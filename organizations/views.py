@@ -372,16 +372,49 @@ class JITElevatedAccessGrantView(APIView):
         if getattr(request.user, 'is_staff', False):
             return qs.filter(requester_q | exact_approver_q | legacy_scope_q)
 
-        admin_org_ids = OrganizationMembership.objects.filter(
+        # PLAT-7343: a lead/member of a scope's mapped approver team can see
+        # grants in that scope (so the approver can list + decide pending
+        # grants). Without this, mapped-approver seats 404 on the grants they
+        # are entitled to approve — the silent "no entitled approver" defect.
+        user_team_names = {
+            name.casefold()
+            for name in Team.objects.filter(
+                id__in=_active_approver_team_ids(user_id),
+            ).values_list('name', flat=True)
+        }
+        mapped_visible_scopes = {
+            scope
+            for scope, team_name in JITElevatedAccessGrant.APPROVER_TEAM_BY_SCOPE.items()
+            if team_name.casefold() in user_team_names
+        }
+        admin_org_ids = list(OrganizationMembership.objects.filter(
             user_id=user_id,
             role__in=['owner', 'admin'],
             is_active=True,
             organization__is_active=True,
-        ).values_list('organization_id', flat=True)
+        ).values_list('organization_id', flat=True))
+        # PLAT-7343 P2b (rui 10-22): the mapped-approver branch must be org-scoped
+        # like the legacy-scope branch — otherwise a Platform-team member lists
+        # kubernetes.rbac.apply grants across every organization. The scope is the
+        # orgs the actor belongs to (active, non-pending membership): a Platform
+        # member of a SECOND org sees no foreign grants, while a mapped approver
+        # with a plain member seat still sees their own org's grants (the
+        # owner/admin set would strand exactly those approvers — and break the
+        # base-fix proof test_plat7343_mapped_approver_team_can_decide_legacy_scope_grant).
+        actor_org_ids = list(OrganizationMembership.objects.filter(
+            user_id=user_id,
+            is_active=True,
+            is_pending=False,
+            organization__is_active=True,
+        ).values_list('organization_id', flat=True))
+        mapped_approver_q = Q(scope__in=mapped_visible_scopes) & Q(
+            organization_id__in=actor_org_ids,
+        ) if mapped_visible_scopes else Q()
         return qs.filter(
             requester_q
             | exact_approver_q
             | (legacy_scope_q & Q(organization_id__in=admin_org_ids))
+            | mapped_approver_q
         )
 
     def get(self, request):
@@ -819,6 +852,24 @@ class JITElevatedAccessGrantDecisionView(APIView):
             )
             return None, Response(
                 {'error': 'Requester cannot approve or deny their own JIT grant'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # PLAT-7343: legacy scopes with a mapped approver team (e.g.
+        # kubernetes.rbac.apply) are approved by a lead/member of that team —
+        # never the requester (SoD already enforced above) and never a seat with
+        # no relationship to the mapped team. This repairs the defect where such
+        # grants had NO entitled non-requester approver and pended to expiry.
+        mapped_approver_team = grant.resolved_approver_team()
+        if mapped_approver_team is not None:
+            if _is_active_team_approver(
+                user_id,
+                mapped_approver_team,
+                lock_membership=True,
+            ):
+                return grant, None
+            return None, Response(
+                {'error': f'Approval required from the {mapped_approver_team.name} team'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 

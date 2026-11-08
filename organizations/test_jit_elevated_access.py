@@ -841,6 +841,240 @@ class JITElevatedAccessGrantTests(TestCase):
         )
         self.assertEqual(record_failure.call_count, 3)
 
+    def test_plat7343_mapped_approver_team_can_decide_legacy_scope_grant(self):
+        """PLAT-7343: a legacy mapped-scope JIT grant is approved by a
+        lead/member of the scope's mapped approver team ('Platform') — never
+        the requester (SoD) and never an unrelated seat. Repairs the defect
+        where such grants had NO entitled non-requester approver and pended
+        to expiry. kubernetes.rbac.apply itself moved to exact-policy
+        admission on main, so the legacy semantics are exercised through the
+        surviving ci_deployer alias rows (see _make_legacy_kubernetes_grant)."""
+        identities = (
+            (10, 'aoi@shizuha.com'),   # requester
+            (11, 'hiro@shizuha.com'),  # Platform team member (approver)
+            (12, 'unrelated@shizuha.com'),
+        )
+        for user_id, email in identities:
+            OrganizationMembership.objects.create(
+                organization=self.org,
+                user_id=user_id,
+                user_email=email,
+                role='member',
+                is_pending=False,
+            )
+        platform = Team.objects.create(
+            organization=self.org,
+            name='Platform',
+            lead_id=11,
+            lead_email='hiro@shizuha.com',
+        )
+        hiro_profile = EmployeeProfile.objects.get(
+            membership__user_id=11, membership__organization=self.org,
+        )
+        TeamMembership.objects.create(
+            team=platform,
+            employee_profile=hiro_profile,
+            role='member',
+        )
+
+        # Requester (aoi) holds a legacy mapped-scope grant row.
+        self._auth(user_id=10, email='aoi@shizuha.com')
+        grant = self._make_legacy_kubernetes_grant()
+        self.assertEqual(grant.approver_team, None)  # legacy row, no exact policy
+        self.assertEqual(grant.scope, 'kubernetes.ci_deployer_rbac.apply')
+
+        # SoD: the requester cannot approve their own grant, even as staff.
+        self._auth(user_id=10, email='aoi@shizuha.com', is_staff=True)
+        self_approval = self.client.post(
+            f'/api/jit-elevations/{grant.pk}/approve/',
+            {'note': 'self approval must fail'},
+            format='json',
+        )
+        self.assertEqual(self_approval.status_code, status.HTTP_403_FORBIDDEN)
+
+        # An unrelated seat cannot discover or decide the grant.
+        self._auth(user_id=12, email='unrelated@shizuha.com')
+        hidden = self.client.get('/api/jit-elevations/', {'status': 'pending'})
+        self.assertEqual(hidden.status_code, status.HTTP_200_OK)
+        self.assertNotIn(grant.id, [row['id'] for row in hidden.data['results']])
+        unauthorized = self.client.post(
+            f'/api/jit-elevations/{grant.pk}/approve/',
+            {'note': 'unrelated peer'},
+            format='json',
+        )
+        self.assertEqual(unauthorized.status_code, status.HTTP_403_FORBIDDEN)
+
+        # A Platform team member (non-requester) can list the pending grant and
+        # approve it — the previously-missing entitled approver seat.
+        self._auth(user_id=11, email='hiro@shizuha.com')
+        visible = self.client.get('/api/jit-elevations/', {'status': 'pending'})
+        self.assertEqual(visible.status_code, status.HTTP_200_OK)
+        self.assertIn(grant.id, [row['id'] for row in visible.data['results']])
+        approval = self.client.post(
+            f'/api/jit-elevations/{grant.pk}/approve/',
+            {'note': 'Platform peer approval of kubernetes RBAC apply'},
+            format='json',
+        )
+        self.assertEqual(approval.status_code, status.HTTP_200_OK)
+        grant.refresh_from_db()
+        self.assertTrue(grant.is_active_now())
+
+    def _make_legacy_kubernetes_grant(self, organization=None, requester_id=10,
+                                      requester_email='aoi@shizuha.com',
+                                      reason='PLAT-7343 regression probe',
+                                      task_key='PLAT-7175'):
+        """Create one legacy mapped-scope JIT grant row and return it.
+
+        kubernetes.rbac.apply became an exact-policy scope on main
+        (9b7dc2b, Origin-brokered consumption: approver team resolved at
+        admission, ttl capped at 900, commit_sha required), so the
+        mapped-approver authority path this card repairs governs the
+        remaining legacy rows — grants recorded under the
+        kubernetes.ci_deployer_rbac.apply alias, which ORIG-361 blocks at
+        admission but which still exist in the ledger. Those rows keep
+        approver_team=None and are decided/visible exclusively through
+        resolved_approver_team()/mapped_approver_q.
+        """
+        grant = JITElevatedAccessGrant.objects.create(
+            organization=organization or self.org,
+            requester_user_id=requester_id,
+            requester_email=requester_email,
+            scope='kubernetes.ci_deployer_rbac.apply',
+            requested_role='admin',
+            reason=reason,
+            task_key=task_key,
+            ttl_seconds=3600,
+            status=JITElevatedAccessGrant.STATUS_PENDING,
+        )
+        return grant
+
+    def test_plat7343_p2a_duplicate_active_approver_team_fails_closed(self):
+        """PLAT-7343 P2a (rui 10-22): duplicate ACTIVE teams matching the mapped
+        approver name must NOT silently resolve to an arbitrary one — the mapped
+        approver seat loses visibility and the grant stays pending (fail closed).
+        Deactivating one duplicate restores unique resolution and approval."""
+        OrganizationMembership.objects.create(
+            organization=self.org, user_id=10, user_email='aoi@shizuha.com',
+            role='member', is_pending=False,
+        )
+        OrganizationMembership.objects.create(
+            organization=self.org, user_id=11, user_email='hiro@shizuha.com',
+            role='member', is_pending=False,
+        )
+        platform = Team.objects.create(
+            organization=self.org, name='Platform', lead_id=11,
+            lead_email='hiro@shizuha.com',
+        )
+        Team.objects.create(
+            organization=self.org, name='PLATFORM', lead_id=11,
+            lead_email='hiro@shizuha.com',
+        )
+        hiro_profile = EmployeeProfile.objects.get(
+            membership__user_id=11, membership__organization=self.org,
+        )
+        TeamMembership.objects.create(
+            team=platform, employee_profile=hiro_profile, role='member',
+        )
+        grant = self._make_legacy_kubernetes_grant()
+
+        # Duplicates: list visibility is driven by the actor's own mapped-team
+        # membership and still works, but the DECIDE path resolves the mapped
+        # team — which must fail closed on ambiguity rather than pick one.
+        self._auth(user_id=11, email='hiro@shizuha.com')
+        blocked = self.client.post(
+            f'/api/jit-elevations/{grant.pk}/approve/',
+            {'note': 'ambiguous approver team'},
+            format='json',
+        )
+        self.assertEqual(blocked.status_code, status.HTTP_403_FORBIDDEN)
+        grant.refresh_from_db()
+        self.assertFalse(grant.is_active_now())
+
+        # Deactivate one duplicate → resolution is unique again → approval works.
+        Team.objects.filter(
+            organization=self.org, name__iexact='PLATFORM',
+        ).exclude(pk=platform.pk).update(is_active=False)
+        visible = self.client.get('/api/jit-elevations/', {'status': 'pending'})
+        self.assertEqual(visible.status_code, status.HTTP_200_OK)
+        self.assertIn(grant.id, [row['id'] for row in visible.data['results']])
+        approval = self.client.post(
+            f'/api/jit-elevations/{grant.pk}/approve/',
+            {'note': 'unique Platform resolution approval'},
+            format='json',
+        )
+        self.assertEqual(approval.status_code, status.HTTP_200_OK)
+        grant.refresh_from_db()
+        self.assertTrue(grant.is_active_now())
+
+    def test_plat7343_p2b_mapped_approver_cannot_list_foreign_org_grants(self):
+        """PLAT-7343 P2b (rui 10-22): a Platform-team member sees mapped-scope
+        grants ONLY in organizations they belong to — never across orgs."""
+        foreign_org = Organization.objects.create(
+            name='Foreign Inc', slug='foreign-inc', owner_id=500,
+        )
+        OrganizationMembership.objects.create(
+            organization=foreign_org, user_id=500,
+            user_email='foreign-owner@foreign.test',
+            role='owner', is_pending=False,
+        )
+        for org, owner_email in ((self.org, 'owner@acme.com'), (foreign_org, 'foreign-owner@foreign.test')):
+            OrganizationMembership.objects.create(
+                organization=org, user_id=10, user_email='aoi@shizuha.com',
+                role='member', is_pending=False,
+            )
+            OrganizationMembership.objects.create(
+                organization=org, user_id=11, user_email='hiro@shizuha.com',
+                role='member', is_pending=False,
+            )
+            platform = Team.objects.create(
+                organization=org, name='Platform', lead_id=11,
+                lead_email='hiro@shizuha.com',
+            )
+            profile = EmployeeProfile.objects.get(
+                membership__user_id=11, membership__organization=org,
+            )
+            TeamMembership.objects.create(
+                team=platform, employee_profile=profile, role='member',
+            )
+        own_grant = self._make_legacy_kubernetes_grant()
+        foreign_grant = self._make_legacy_kubernetes_grant(
+            organization=foreign_org, reason='PLAT-7343 foreign-org probe',
+        )
+
+        # Hiro belongs to BOTH orgs here; prove scoping with a third org hiro
+        # has NO membership in: its Platform team grant must stay invisible.
+        stranger_org = Organization.objects.create(
+            name='Stranger LLC', slug='stranger-llc', owner_id=600,
+        )
+        OrganizationMembership.objects.create(
+            organization=stranger_org, user_id=600,
+            user_email='stranger-owner@stranger.test',
+            role='owner', is_pending=False,
+        )
+        # Hiro is listed as lead of the stranger-org Platform team but has NO
+        # membership there; the grant row still exists in that org's ledger.
+        Team.objects.create(
+            organization=stranger_org, name='Platform', lead_id=11,
+            lead_email='hiro@shizuha.com',
+        )
+        stranger_grant = self._make_legacy_kubernetes_grant(
+            organization=stranger_org, reason='PLAT-7343 stranger-org probe',
+        )
+
+        self._auth(user_id=11, email='hiro@shizuha.com')
+        visible = self.client.get('/api/jit-elevations/', {'status': 'pending'})
+        self.assertEqual(visible.status_code, status.HTTP_200_OK)
+        seen = [row['id'] for row in visible.data['results']]
+        self.assertIn(own_grant.id, seen)
+        self.assertIn(foreign_grant.id, seen)          # hiro is a member of both
+        self.assertNotIn(stranger_grant.id, seen)      # no membership → invisible
+        stranger_blocked = self.client.post(
+            f'/api/jit-elevations/{stranger_grant.pk}/approve/',
+            {'note': 'cross-org approval attempt'},
+            format='json',
+        )
+        self.assertEqual(stranger_blocked.status_code, status.HTTP_403_FORBIDDEN)
+
     @override_settings(CONNECT_SECURITY_EVENT_ORIGIN_SECRET='boundary-secret')
     @patch('organizations.security_events.requests.post')
     @patch('organizations.security_events._metrics_redis_client')
