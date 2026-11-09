@@ -313,7 +313,8 @@ class ProjectMembershipProjectionMetricsTests(SimpleTestCase):
     @patch('organizations.security_events._metrics_redis_client')
     def test_projection_outcomes_render_for_prometheus(self, mock_redis):
         mock_redis.return_value.mget.return_value = (
-            [None] * len(security_events._METRIC_OUTCOMES) + [None] + ['3', None, '11']
+            # boundary outcomes + jit invariant + ORIG-412 jit dispatch + projection outcomes
+            [None] * len(security_events._METRIC_OUTCOMES) + [None, None] + ['3', None, '11']
         )
 
         body = security_events.render_boundary_event_metrics()
@@ -342,6 +343,7 @@ class ProjectMembershipProjectionMetricsTests(SimpleTestCase):
         # slicing is positional.
         self.assertIn('platform_boundary_event_producer_total{service="admin",outcome="success"} 0', body)
         self.assertIn('platform_jit_approval_invariant_failures_total{service="admin"} 0', body)
+        self.assertIn('platform_jit_dispatch_failures_total{service="admin"} 0', body)
 
     @patch('organizations.security_events._metrics_redis_client')
     def test_metrics_backend_failure_is_reported_not_hidden(self, mock_redis):
@@ -353,6 +355,7 @@ class ProjectMembershipProjectionMetricsTests(SimpleTestCase):
         self.assertIn('platform_boundary_event_producer_probe_errors{service="admin"} 1', body)
         self.assertNotIn('platform_boundary_event_producer_total', body)
         self.assertNotIn('platform_jit_approval_invariant_failures_total', body)
+        self.assertNotIn('platform_jit_dispatch_failures_total', body)
         self.assertNotIn('platform_project_membership_projection_total', body)
 
     @patch('organizations.security_events._metrics_redis_client')

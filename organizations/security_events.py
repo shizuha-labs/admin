@@ -31,6 +31,7 @@ _METRIC_OUTCOMES = (
 )
 _METRIC_KEY = 'admin:metrics:boundary_security_event:{outcome}'
 _JIT_INVARIANT_METRIC_KEY = 'admin:metrics:jit_approval_invariant_failure'
+_JIT_DISPATCH_FAILURE_METRIC_KEY = 'admin:metrics:jit_dispatch_failure'
 _DEDUPE_KEY = 'admin:security_event_dedupe:{digest}'
 
 # PLAT-5338: project-membership projection outcomes.
@@ -116,6 +117,24 @@ def record_jit_invariant_failure() -> bool:
         return False
 
 
+def record_jit_dispatch_failure() -> bool:
+    """Persist one Kubernetes JIT consume→Origin dispatch failure (ORIG-412).
+
+    ORIG-387-era datum: ten consecutive dispatch attempts answered TCP
+    Connection refused for ~103s (03:33:04–03:34:47Z) and the failure was
+    visible only in the relational rows — a long refusal window can quietly
+    eat a single-use grant's consume window across every queued JIT grant.
+    This counter is the Prometheus-facing streak detector; the requesting
+    Pulse card gets the per-incident comment separately.
+    """
+    try:
+        _metrics_redis_client().incr(_JIT_DISPATCH_FAILURE_METRIC_KEY)
+        return True
+    except Exception:
+        logger.exception('ORIG-412 failed to persist JIT dispatch failure metric')
+        return False
+
+
 def record_project_membership_projection(outcome: str) -> bool:
     """Persist one non-authoritative project-membership projection outcome.
 
@@ -162,10 +181,12 @@ def render_boundary_event_metrics() -> str:
     counts = None
     projection_counts = None
     jit_invariant_failures = None
+    jit_dispatch_failures = None
     probe_errors = 0
     keys = (
         [_METRIC_KEY.format(outcome=value) for value in _METRIC_OUTCOMES]
         + [_JIT_INVARIANT_METRIC_KEY]
+        + [_JIT_DISPATCH_FAILURE_METRIC_KEY]
         + [_PROJECTION_METRIC_KEY.format(outcome=value) for value in _PROJECTION_OUTCOMES]
     )
     try:
@@ -182,11 +203,12 @@ def render_boundary_event_metrics() -> str:
         parsed_projection_counts.update({
             outcome: int(raw or 0)
             for outcome, raw in zip(
-                _PROJECTION_OUTCOMES, values[len(_METRIC_OUTCOMES) + 1:],
+                _PROJECTION_OUTCOMES, values[len(_METRIC_OUTCOMES) + 2:],
             )
         })
         counts = parsed_counts
         jit_invariant_failures = parsed_jit_invariant_failures
+        jit_dispatch_failures = int(values[len(_METRIC_OUTCOMES) + 1] or 0)
         projection_counts = parsed_projection_counts
     except Exception:
         probe_errors = 1
@@ -211,6 +233,12 @@ def render_boundary_event_metrics() -> str:
             '# HELP platform_jit_approval_invariant_failures_total Persisted exact-team JIT mechanism failures.',
             '# TYPE platform_jit_approval_invariant_failures_total counter',
             f'platform_jit_approval_invariant_failures_total{{service="admin"}} {jit_invariant_failures}',
+        ])
+    if jit_dispatch_failures is not None:
+        lines.extend([
+            '# HELP platform_jit_dispatch_failures_total Kubernetes JIT consume→Origin dispatch failures (ORIG-412).',
+            '# TYPE platform_jit_dispatch_failures_total counter',
+            f'platform_jit_dispatch_failures_total{{service="admin"}} {jit_dispatch_failures}',
         ])
     if projection_counts is not None:
         lines.extend([
