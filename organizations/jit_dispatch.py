@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import urllib.parse
 import urllib.error
 import urllib.request
 
@@ -17,6 +18,52 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _notify_requesting_card(use, error: str) -> bool:
+    """Surface one dispatch failure on the requesting Pulse card (ORIG-412).
+
+    ORIG-387-era datum: the ten refused dispatch attempts behind grant 834 /
+    use 144 were visible only in the Admin DB while the requesting card sat
+    silent. Best-effort and fail-soft: a broken Pulse hop must never mask the
+    underlying dispatch evidence (which is persisted independently in
+    ``last_dispatch_error`` and the ``dispatch_failed`` event row). No
+    clipboard/payload content and no token values ever leave this function —
+    only the already-sanitized exception string and grant identifiers.
+    """
+    try:
+        task_key = str(getattr(use.grant, 'task_key', '') or '').strip()
+        if not task_key:
+            return False
+        base = str(
+            os.environ.get('SHIZUHA_PULSE_API_URL', 'http://shizuha-pulse:8002/api')
+        ).rstrip('/')
+        credential = str(getattr(settings, 'ADMIN_V2_PULSE_SERVICE_CREDENTIAL', '') or '')
+        if not credential:
+            logger.warning('ORIG-412 card surface skipped: Admin→Pulse credential not configured')
+            return False
+        detail = str(error)[:500]
+        payload = json.dumps({
+            'content': (
+                f'🔴 Kubernetes JIT dispatch failure (grant {use.grant_id}, use {use.pk}, '
+                f'attempt {use.dispatch_attempts + 1}): {detail} — the consume window is '
+                f'spending on a dead hop; Admin→Origin dispatch is degrading (ORIG-412).'
+            ),
+        }).encode('utf-8')
+        request = urllib.request.Request(
+            f'{base}/items/{urllib.parse.quote(task_key, safe="")}/comments/',
+            data=payload,
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {credential}',
+            },
+            method='POST',
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return 200 <= getattr(response, 'status', 0) < 300
+    except Exception:
+        logger.warning('ORIG-412 failed to surface dispatch failure on requesting card', exc_info=True)
+        return False
 
 
 def _dispatch_request(use):
@@ -163,8 +210,11 @@ def dispatch_kubernetes_jit_use_fail_loud(use_id):
         return dispatch_kubernetes_jit_use(use_id)
     except Exception as exc:
         logger.exception('Kubernetes JIT dispatch failed use_id=%s', use_id)
+        from .security_events import record_jit_dispatch_failure
+        record_jit_dispatch_failure()
         use = JITElevatedAccessGrantUse.objects.select_related('grant').filter(pk=use_id).first()
         if use is not None:
+            _notify_requesting_card(use, str(exc))
             JITElevatedAccessGrantUse.objects.filter(pk=use.pk).update(
                 dispatch_status='failed', dispatch_attempts=use.dispatch_attempts + 1,
                 last_dispatch_error=str(exc)[:1000],

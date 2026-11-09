@@ -1,12 +1,17 @@
 import io
 import json
+import urllib.error
 from datetime import timedelta
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from .jit_dispatch import dispatch_kubernetes_jit_use, reconcile_pending_kubernetes_jit_uses
+from .jit_dispatch import (
+    dispatch_kubernetes_jit_use,
+    dispatch_kubernetes_jit_use_fail_loud,
+    reconcile_pending_kubernetes_jit_uses,
+)
 from .models import (
     JITElevatedAccessGrant,
     JITElevatedAccessGrantUse,
@@ -185,3 +190,92 @@ class KubernetesJITDispatchTests(TestCase):
         )
         self.assertEqual(reconcile_pending_kubernetes_jit_uses(), [])
         dispatch.assert_not_called()
+
+
+class _CardOk:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return b'{}'
+
+
+def _make_revoked_grant_use(task_key='CTX-57'):
+    org = Organization.objects.create(name='Acme', slug=f'acme-{task_key}', owner_id=1)
+    grant = JITElevatedAccessGrant.objects.create(
+        organization=org, requester_user_id=10,
+        requester_email='requester@shizuha.com',
+        scope=JITElevatedAccessGrant.KUBERNETES_RBAC_APPLY_SCOPE,
+        requested_role='admin', reason='test', task_key=task_key,
+        status=JITElevatedAccessGrant.STATUS_REVOKED,
+        target_constraints={
+            'repository': 'shizuha-labs/deploy', 'ref': 'refs/heads/master',
+            'workflow': 'apply-origin-ci-deployer-rbac.yml',
+            'script': 'k3s/origin/apply-ci-deployer-rbac.sh',
+            'commit_sha': 'a' * 40,
+        },
+        constraint_digest=JITElevatedAccessGrant.constraint_digest_for({
+            'repository': 'shizuha-labs/deploy', 'ref': 'refs/heads/master',
+            'workflow': 'apply-origin-ci-deployer-rbac.yml',
+            'script': 'k3s/origin/apply-ci-deployer-rbac.sh',
+            'commit_sha': 'a' * 40,
+        }),
+        revoked_at=timezone.now(), expires_at=timezone.now() + timedelta(minutes=10),
+    )
+    return JITElevatedAccessGrantUse.objects.create(
+        grant=grant, idempotency_key=f'once-{task_key}', request_digest='d' * 64,
+        actor_user_id=10, actor_email='requester@shizuha.com',
+        result={'dispatch_status': 'pending'},
+    )
+
+
+@override_settings(ADMIN_V2_PULSE_SERVICE_CREDENTIAL='svc-cred')
+class DispatchFailureFailLoudTests(TestCase):
+    @override_settings(ORIGIN_API_URL='http://forgejo.invalid')
+    @patch('organizations.security_events.record_jit_dispatch_failure', return_value=True)
+    @patch('organizations.jit_dispatch.urllib.request.urlopen')
+    def test_fail_loud_records_streak_and_surfaces_card(self, urlopen, record_streak):
+        """ORIG-412: a refused dispatch must surface on the requesting card and
+        feed the Prometheus streak detector (grant 834 datum: ten refusals were
+        DB-only-visible)."""
+        use = _make_revoked_grant_use()
+        urlopen.side_effect = [
+            urllib.error.URLError(ConnectionRefusedError(111)),  # dispatch hop
+            _CardOk(),  # card surface
+        ]
+
+        with self.assertRaises(urllib.error.URLError):
+            dispatch_kubernetes_jit_use_fail_loud(use.pk)
+
+        record_streak.assert_called_once_with()
+        self.assertEqual(urlopen.call_count, 2)
+        card_request = urlopen.call_args_list[1].args[0]
+        self.assertIn('/items/CTX-57/comments/', card_request.full_url)
+        self.assertEqual(card_request.headers['Authorization'], 'Bearer svc-cred')
+        body = json.loads(card_request.data)
+        self.assertIn('grant %d' % use.grant_id, body['content'])
+        self.assertIn('urlopen error', body['content'])
+        use.refresh_from_db()
+        self.assertEqual(use.dispatch_status, 'failed')
+        self.assertIn('urlopen error', use.last_dispatch_error)
+
+    @override_settings(ORIGIN_API_URL='http://forgejo.invalid')
+    @patch('organizations.security_events.record_jit_dispatch_failure', return_value=True)
+    @patch('organizations.jit_dispatch.urllib.request.urlopen')
+    def test_card_surface_is_fail_soft(self, urlopen, record_streak):
+        """A broken Pulse hop must never mask the persisted dispatch evidence."""
+        use = _make_revoked_grant_use()
+        urlopen.side_effect = urllib.error.URLError(ConnectionRefusedError(111))
+
+        with self.assertRaises(urllib.error.URLError):
+            dispatch_kubernetes_jit_use_fail_loud(use.pk)
+
+        record_streak.assert_called_once_with()
+        use.refresh_from_db()
+        self.assertEqual(use.dispatch_status, 'failed')
+        self.assertIn('urlopen error', use.last_dispatch_error)
