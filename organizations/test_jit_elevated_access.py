@@ -609,6 +609,45 @@ class JITElevatedAccessGrantTests(TestCase):
         self.assertEqual(grant.target_role, 'member')
         self.assertTrue(grant.has_complete_current_exact_authority())
 
+        # PLAT-11995: a login that is not this user id's roster display name
+        # must be refused before a grant row exists.
+        ryo_membership = OrganizationMembership.objects.get(
+            organization=self.org, user_id=13,
+        )
+        ryo_membership.display_name = 'ryo'
+        ryo_membership.save(update_fields=['display_name', 'updated_at'])
+        self._auth(user_id=10, email='aoi@shizuha.com')
+        mismatched = self.client.post('/api/jit-elevations/', {
+            'org_slug': self.org.slug,
+            'scope': JITElevatedAccessGrant.TEAM_MEMBER_ADD_SCOPE,
+            'requested_role': 'admin',
+            'reason': 'PLAT-11995 roster identity check',
+            'task_key': 'PLAT-11995',
+            'ttl_seconds': 900,
+            'target_team_id': merge.id,
+            'target_user_id': 13,
+            'target_login': 'kai',
+            'target_role': 'member',
+        }, format='json')
+        self.assertEqual(mismatched.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(mismatched.data['code'], 'jit_target_roster_mismatch')
+        matched = self.client.post('/api/jit-elevations/', {
+            'org_slug': self.org.slug,
+            'scope': JITElevatedAccessGrant.TEAM_MEMBER_ADD_SCOPE,
+            'requested_role': 'admin',
+            'reason': 'PLAT-11995 roster identity check',
+            'task_key': 'PLAT-11995',
+            'ttl_seconds': 900,
+            'target_team_id': merge.id,
+            'target_user_id': 13,
+            'target_login': 'ryo',
+            'target_role': 'member',
+        }, format='json')
+        self.assertEqual(matched.status_code, status.HTTP_201_CREATED)
+        # The matched post is a real grant. Drop it so the later exact-roster
+        # visibility assertion still sees only the grant under test.
+        JITElevatedAccessGrant.objects.filter(pk=matched.data['grant']['id']).delete()
+
         # A stale Team.lead_id is not authority after the lead leaves the org.
         removed_lead_membership = OrganizationMembership.objects.get(
             organization=self.org,
