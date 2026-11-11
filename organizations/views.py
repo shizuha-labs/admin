@@ -586,9 +586,30 @@ class JITElevatedAccessGrantView(APIView):
                     membership__user_id=target_user_id,
                     membership__is_active=True,
                     membership__is_pending=False,
-                ).first()
+                ).select_related('membership').first()
                 if target_profile is None:
                     return Response({'error': 'Target user is not an active employee'}, status=status.HTTP_404_NOT_FOUND)
+                # PLAT-11995: the numeric id alone is not the roster identity.
+                # A caller-supplied login must be the same active membership's
+                # display name. A mismatch is the uid-mapping mis-landing
+                # (grant text names one person, the id lands on another).
+                claimed_login = (
+                    request.data.get('target_login')
+                    or request.data.get('login')
+                    or request.data.get('username')
+                    or ''
+                )
+                claimed_login = str(claimed_login).strip().lower()
+                roster_login = (target_profile.membership.display_name or '').strip().lower()
+                if claimed_login and claimed_login != roster_login:
+                    return Response(
+                        {
+                            'error': 'Target identity does not match the org roster',
+                            'code': 'jit_target_roster_mismatch',
+                            'roster_comparator': 'organization_membership.user_id+display_name',
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
                 constraints = {
                     'organization_id': org.id,
                     'team_id': target_team.id,
