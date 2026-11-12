@@ -298,6 +298,111 @@ class JITElevatedAccessGrantTests(TestCase):
         self.assertEqual(expired_result.status_code, status.HTTP_403_FORBIDDEN)
         self.assertFalse(expired.uses.exists())
 
+    @patch('organizations.tasks.dispatch_kubernetes_jit_use_task.delay')
+    def test_plat10341_consume_after_decided_at_within_ttl_succeeds_despite_stale_mint(
+            self, dispatch):
+        """PLAT-10341 / PLAT-9594 leg: the Kubernetes JIT TTL is anchored to
+        the approval decision timestamp (decided_at), not the mint timestamp
+        (created_at).  A grant whose created_at + TTL window closed long ago
+        must still consume successfully when the decision lands inside the
+        TTL, because approve() re-anchors expires_at at decided_at + ttl."""
+        for user_id, email in ((10, 'requester@shizuha.com'), (11, 'peer@shizuha.com')):
+            OrganizationMembership.objects.create(
+                organization=self.org, user_id=user_id, user_email=email,
+                role='member', is_pending=False,
+            )
+        platform = Team.objects.create(organization=self.org, name='Platform')
+        peer_profile = EmployeeProfile.objects.get(
+            membership__organization=self.org, membership__user_id=11,
+        )
+        TeamMembership.objects.create(team=platform, employee_profile=peer_profile, role='member')
+        sha = 'a' * 40
+        ttl_seconds = 600
+
+        self._auth(user_id=10, email='requester@shizuha.com')
+        requested = self.client.post('/api/jit-elevations/', {
+            'org_slug': self.org.slug,
+            'scope': JITElevatedAccessGrant.KUBERNETES_RBAC_APPLY_SCOPE,
+            'reason': 'PLAT-10341 decided_at-anchored TTL boundary',
+            'task_key': 'PLAT-10341',
+            'ttl_seconds': ttl_seconds,
+            'commit_sha': sha,
+        }, format='json')
+        self.assertEqual(requested.status_code, status.HTTP_201_CREATED)
+        grant = JITElevatedAccessGrant.objects.get(pk=requested.data['grant']['id'])
+
+        # Force the defect precondition: the mint (created_at) + TTL window
+        # closed three TTLs ago.  A mint-rooted TTL check would reject every
+        # consumption of this grant from here on.
+        stale_mint = timezone.now() - timedelta(seconds=3 * ttl_seconds)
+        JITElevatedAccessGrant.objects.filter(pk=grant.pk).update(created_at=stale_mint)
+        grant.refresh_from_db()
+        self.assertLess(grant.created_at + timedelta(seconds=ttl_seconds), timezone.now())
+
+        self._auth(user_id=11, email='peer@shizuha.com')
+        approval = self.client.post(
+            f'/api/jit-elevations/{grant.pk}/approve/',
+            {'note': 'independent peer approval after a stale mint window'},
+            format='json',
+        )
+        self.assertEqual(approval.status_code, status.HTTP_200_OK)
+        grant.refresh_from_db()
+        # The boundary contract: the grant is live on the decided_at clock.
+        self.assertIsNotNone(grant.decided_at)
+        self.assertGreater(grant.decided_at, grant.created_at + timedelta(seconds=ttl_seconds))
+        self.assertEqual(
+            grant.expires_at, grant.decided_at + timedelta(seconds=grant.ttl_seconds),
+        )
+        self.assertTrue(grant.is_active_now())
+
+        # Consumption after decided_at, within TTL, must SUCCEED.
+        self._auth(user_id=10, email='requester@shizuha.com')
+        action = {
+            'idempotency_key': 'PLAT-10341-v1',
+            'expected_sha': sha,
+            'action': 'apply-origin-ci-deployer-rbac',
+        }
+        with self.captureOnCommitCallbacks(execute=True):
+            consumed = self.client.post(
+                f'/api/jit-elevations/{grant.pk}/consume-kubernetes/', action, format='json',
+            )
+        self.assertEqual(consumed.status_code, status.HTTP_202_ACCEPTED, consumed.data)
+        self.assertEqual(JITElevatedAccessGrantUse.objects.filter(grant=grant).count(), 1)
+        dispatch.assert_called_once()
+        grant.refresh_from_db()
+        self.assertEqual(grant.uses_consumed, 1)
+        # ORIG-412 (0019 migration): the burn moved post-dispatch-acceptance;
+        # consumption now parks the grant in pending_dispatch instead of
+        # revoking immediately. The decided_at-anchored boundary this test
+        # pins is unchanged: the consume succeeded within the decided_at
+        # window despite a stale mint.
+        self.assertEqual(grant.status, JITElevatedAccessGrant.STATUS_PENDING_DISPATCH)
+
+        # Inverse leg: once the decided_at-anchored window lapses, the same
+        # consumption fails closed and mints no use.
+        late_grant = JITElevatedAccessGrant.objects.create(
+            organization=self.org, requester_user_id=10,
+            requester_email='requester@shizuha.com',
+            scope=JITElevatedAccessGrant.KUBERNETES_RBAC_APPLY_SCOPE,
+            requested_role='admin', reason='decided_at window lapsed',
+            task_key='PLAT-10341', ttl_seconds=ttl_seconds,
+            status=JITElevatedAccessGrant.STATUS_APPROVED,
+            approval_path=JITElevatedAccessGrant.APPROVAL_TEAM,
+            approver_team=platform, owning_team='Platform',
+            decided_by_user_id=11, decided_by_email='peer@shizuha.com',
+            decided_at=timezone.now() - timedelta(seconds=ttl_seconds + 1),
+            policy_key=grant.policy_key, policy_version=grant.policy_version,
+            policy_digest=grant.policy_digest,
+            target_constraints=grant.target_constraints,
+            constraint_digest=grant.constraint_digest, max_uses=1,
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+        late_result = self.client.post(
+            f'/api/jit-elevations/{late_grant.pk}/consume-kubernetes/', action, format='json',
+        )
+        self.assertEqual(late_result.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(late_grant.uses.exists())
+
     def test_verified_policy_org_member_add_auto_approves(self):
         self._auth(user_id=2, email='admin-platform@shizuha.com', is_staff=True)
         response = self.client.post('/api/jit-elevations/', {
