@@ -171,17 +171,25 @@ jobs:
             [ "${COMPLETE}" = "True" ] && break
             if [ "${FAILED}" = "True" ]; then
               echo "::error::Admin authz-invariant test gate FAILED — suite output follows"
-              kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || true
+              { kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || echo "kubectl logs unavailable (pod may be TTL-deleted)"; } | tee authz-gate-output.txt
               exit 1
             fi
             if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
               echo "::error::Admin authz-invariant test gate timed out after 1800s"
-              kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || true
+              { kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || echo "kubectl logs unavailable (pod may be TTL-deleted)"; } | tee authz-gate-output.txt
               exit 1
             fi
             sleep 10
           done
           kubectl logs -n build "job/${JOB}" --all-containers --tail=160 || true
+      - name: Retain gate logs (survives pod TTL and runner teardown)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: authz-gate-log-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: authz-gate-output.txt
+          if-no-files-found: ignore
   # Build+push the multi-arch image CONCURRENTLY with the authz gate. Only the
   # deploy job below gates the rollout on BOTH authz-test-gate AND build, so the
   # long kaniko build no longer waits serially behind the Django suite.

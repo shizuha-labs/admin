@@ -242,6 +242,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'organizations.tasks.reconcile_pending_kubernetes_jit_uses_task',
         'schedule': 60.0,
     },
+    # PLAT-13057: TTL lapse is a decision — notify approved→expired once.
+    'notify-expired-jit-grants': {
+        'task': 'organizations.tasks.notify_expired_jit_grants_task',
+        'schedule': 300.0,
+    },
 }
 
 # OpenAPI/Swagger
@@ -263,6 +268,18 @@ SHIZUHA_CONNECT_SECURITY_EVENT_URL = os.environ.get(
 CONNECT_SECURITY_EVENT_ORIGIN_SECRET = os.environ.get('CONNECT_SECURITY_EVENT_ORIGIN_SECRET', '')
 CONNECT_SECURITY_EVENT_TIMEOUT_SECONDS = float(os.environ.get('CONNECT_SECURITY_EVENT_TIMEOUT_SECONDS', '1.0'))
 CONNECT_SECURITY_EVENT_EMIT_ENABLED = os.environ.get('CONNECT_SECURITY_EVENT_EMIT_ENABLED', 'true').lower() in ('1', 'true', 'yes')
+
+# PLAT-13057: JIT decision-hook notifications on Connect's system-DM lane.
+# Requires the shared system-message origin secret and `shizuha-admin` in
+# Connect's CONNECT_SYSTEM_MESSAGE_ALLOWLIST (deploy-values side).
+SHIZUHA_CONNECT_SYSTEM_MESSAGE_URL = os.environ.get(
+    'SHIZUHA_CONNECT_SYSTEM_MESSAGE_URL',
+    'http://localhost:8019/api/internal/system-message/',
+)
+CONNECT_SYSTEM_MESSAGE_ORIGIN_SECRET = os.environ.get('CONNECT_SYSTEM_MESSAGE_ORIGIN_SECRET', '')
+JIT_DECISION_NOTIFICATIONS_ENABLED = os.environ.get(
+    'JIT_DECISION_NOTIFICATIONS_ENABLED', 'true',
+).lower() in ('1', 'true', 'yes')
 ORIGIN_API_URL = os.environ.get(
     'ORIGIN_API_URL', 'http://localhost:3000'
 )
