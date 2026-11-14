@@ -49,6 +49,7 @@ from .services.team_roster_authority import (
     fleet_agent_write_denial,
 )
 from .security_events import emit_boundary_denial, record_jit_invariant_failure
+from . import jit_notifications
 from .service_display import serialize_org_service
 
 logger = logging.getLogger(__name__)
@@ -724,6 +725,14 @@ class JITElevatedAccessGrantView(APIView):
                 approval_path=JITElevatedAccessGrant.APPROVAL_POLICY,
             )
             _audit_jit(grant, 'approved', request, source='policy', detail={'policy_slug': policy_slug})
+            # PLAT-13057: policy approvals are decisions too — the requester
+            # (and owning-team lead) learn immediately, not at TTL lapse.
+            transaction.on_commit(
+                lambda g=grant, d=grant.decided_at: jit_notifications.emit_jit_decision_notification(
+                    grant=g, decision='approved',
+                    actor_email=f'policy:{policy_slug}', decided_at=d,
+                )
+            )
 
         return Response({
             'auto_approved': auto_approved,
@@ -969,6 +978,16 @@ class JITElevatedAccessGrantDecisionView(APIView):
                 request,
                 source=('superuser-break-glass' if getattr(request.user, 'is_superuser', False) else 'api'),
                 detail={'note': note},
+            )
+            # PLAT-13057: every decision notifies the requester (always) and
+            # the owning-team lead (when resolvable) on Connect's system-DM
+            # lane. on_commit keeps network I/O outside the grant row-lock
+            # transaction and never notifies a rolled-back decision.
+            transaction.on_commit(
+                lambda g=grant, et=event_type, a=actor_email, d=grant.decided_at, n=note:
+                jit_notifications.emit_jit_decision_notification(
+                    grant=g, decision=et, actor_email=a, decided_at=d, note=n,
+                )
             )
 
         return Response({'grant': JITElevatedAccessGrantSerializer(grant).data})
