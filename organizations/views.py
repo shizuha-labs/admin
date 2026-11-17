@@ -20,7 +20,7 @@ from .models import (
     Organization, OrganizationMembership,
     MembershipChange,
     JITElevatedAccessGrant, JITElevatedAccessGrantEvent,
-    JITElevatedAccessGrantUse,
+    JITElevatedAccessGrantUse, WaiverIssuanceGrant,
     Department, Team, Position, EmployeeProfile, TeamMembership,
     OrganizationServiceAccess,
 )
@@ -4700,3 +4700,77 @@ class OrgMemberServicesView(APIView):
         except Exception as e:
             logger.error(f"Failed to proxy member service access to shizuha-id: {e}")
             return Response({'error': 'Failed to reach identity service'}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+class WaiverIssuanceGrantView(APIView):
+    """SCS-256. Owner/admin of the org issues a standing waiver grant.
+
+    A seat without an active grant cannot mint. Revocation is a later POST
+    and does not rewrite receipts already issued under the grant.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user_id, email = _actor_identity(request)
+        org_id = request.data.get('organization_id')
+        subject_email = (request.data.get('subject_email') or '').strip().lower()
+        waiver_type = request.data.get('waiver_type') or WaiverIssuanceGrant.WAIVER_DEPLOY_VERIFY
+        if not org_id or not subject_email:
+            return Response(
+                {'code': 'waiver_grant_invalid', 'detail': 'organization_id and subject_email are required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if waiver_type != WaiverIssuanceGrant.WAIVER_DEPLOY_VERIFY:
+            return Response(
+                {'code': 'waiver_type_unsupported', 'detail': waiver_type},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            org = Organization.objects.get(pk=org_id)
+        except Organization.DoesNotExist:
+            return Response({'code': 'org_not_found'}, status=status.HTTP_404_NOT_FOUND)
+        issuer = OrganizationMembership.objects.filter(
+            organization=org, user_id=user_id, is_active=True,
+            role__in=('owner', 'admin'),
+        ).first()
+        if issuer is None and not getattr(request.user, 'is_superuser', False):
+            return Response(
+                {'code': 'waiver_grant_forbidden', 'detail': 'owner or admin required'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        grant = WaiverIssuanceGrant.objects.create(
+            organization=org,
+            subject_user_id=int(request.data.get('subject_user_id') or 0),
+            subject_email=subject_email,
+            waiver_type=waiver_type,
+            expires_at=request.data.get('expires_at') or None,
+            max_uses=request.data.get('max_uses') or None,
+            issued_by_user_id=user_id or 0,
+            issued_by_email=email,
+        )
+        return Response(
+            {'grant_id': grant.id, 'waiver_type': grant.waiver_type, 'subject_email': grant.subject_email},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class WaiverIssuanceGrantRevokeView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        user_id, _email = _actor_identity(request)
+        try:
+            grant = WaiverIssuanceGrant.objects.select_related('organization').get(pk=pk)
+        except WaiverIssuanceGrant.DoesNotExist:
+            return Response({'code': 'grant_not_found'}, status=status.HTTP_404_NOT_FOUND)
+        issuer = OrganizationMembership.objects.filter(
+            organization=grant.organization, user_id=user_id, is_active=True,
+            role__in=('owner', 'admin'),
+        ).first()
+        if issuer is None and not getattr(request.user, 'is_superuser', False):
+            return Response({'code': 'waiver_grant_forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        if grant.revoked_at is None:
+            grant.revoked_at = timezone.now()
+            grant.save(update_fields=['revoked_at'])
+        return Response({'grant_id': grant.id, 'revoked_at': grant.revoked_at.isoformat(), 'active': False})
