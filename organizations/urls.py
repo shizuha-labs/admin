@@ -29,6 +29,7 @@ from .views import (
     OrgServiceListView, OrgMemberServicesView, AuditorRoleGrantView,
     JITElevatedAccessGrantView, JITElevatedAccessGrantDetailView,
     JITElevatedAccessGrantDecisionView, KubernetesJITConsumeView,
+    WaiverIssuanceGrantView, WaiverIssuanceGrantRevokeView,
 )
 
 # Main router
@@ -64,6 +65,8 @@ extra_patterns = [
     path('superuser/users/pending/count/', SuperuserPendingUsersCountProxyView.as_view(), name='superuser-pending-users-count'),
     path('superuser/users/<int:user_id>/approve/', SuperuserUserApprovalProxyView.as_view(), name='superuser-user-approve'),
     # JIT elevated access (PLAT-1346)
+    path('waiver-grants/', WaiverIssuanceGrantView.as_view(), name='waiver-grant-create'),
+    path('waiver-grants/<int:pk>/revoke/', WaiverIssuanceGrantRevokeView.as_view(), name='waiver-grant-revoke'),
     path('jit-elevations/', JITElevatedAccessGrantView.as_view(), name='jit-elevation-list-create'),
     path('jit-elevations/<int:pk>/',
          JITElevatedAccessGrantDetailView.as_view(),

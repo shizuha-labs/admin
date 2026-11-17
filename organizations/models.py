@@ -1432,3 +1432,47 @@ class ProjectMember(models.Model):
             models.Index(fields=['pulse_project_id', 'is_active'], name='org_projmem_proj_active_idx'),
             models.Index(fields=['organization', 'pulse_project_id'], name='org_projmem_org_proj_idx'),
         ]
+
+
+class WaiverIssuanceGrant(models.Model):
+    """SCS-256: a named seat may mint one waiver type.
+
+    Distinct from JITElevatedAccessGrant. A grant is standing authority for a
+    waiver_type, not a one-shot elevation. Revocation stops future issuance
+    only; receipts already minted stay immutable.
+    """
+
+    WAIVER_DEPLOY_VERIFY = 'receipt.deploy_verify_waiver'
+    WAIVER_TYPES = [(WAIVER_DEPLOY_VERIFY, 'Deploy-verify waiver')]
+
+    organization = models.ForeignKey(
+        'Organization', on_delete=models.CASCADE, related_name='waiver_grants',
+    )
+    subject_user_id = models.IntegerField(db_index=True)
+    subject_email = models.EmailField()
+    waiver_type = models.CharField(max_length=64, choices=WAIVER_TYPES)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    max_uses = models.PositiveIntegerField(null=True, blank=True)
+    use_count = models.PositiveIntegerField(default=0)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    issued_by_user_id = models.IntegerField()
+    issued_by_email = models.EmailField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'organizations_waiver_issuance_grant'
+        indexes = [
+            models.Index(
+                fields=['subject_email', 'waiver_type', 'revoked_at'],
+                name='org_waiver_subject_type_idx',
+            ),
+        ]
+
+    def is_active(self, now):
+        if self.revoked_at is not None:
+            return False
+        if self.expires_at is not None and self.expires_at <= now:
+            return False
+        if self.max_uses is not None and self.use_count >= self.max_uses:
+            return False
+        return True
