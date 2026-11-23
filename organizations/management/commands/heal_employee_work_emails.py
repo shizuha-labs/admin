@@ -100,7 +100,10 @@ class Command(BaseCommand):
         (``InternalUserByUsernameView``), and it checks
         ``X-Internal-Service-Token`` against its ``INTERNAL_SERVICE_TOKEN``.
         """
-        token = str(getattr(settings, 'ADMIN_INTERNAL_SERVICE_TOKEN', '') or '')
+        # The pod's env value carries a trailing newline. requests rejects a
+        # header value with one (InvalidHeader) before the call is sent, which
+        # is what turned every row into 'unreachable'.
+        token = str(getattr(settings, 'ADMIN_INTERNAL_SERVICE_TOKEN', '') or '').strip()
         headers = {'X-Internal-Service': 'shizuha-admin'}
         if token:
             headers['X-Internal-Service-Token'] = token
@@ -120,8 +123,10 @@ class Command(BaseCommand):
                 headers=self._service_headers(),
                 timeout=5,
             )
-        except requests.RequestException:
-            return '', 'unreachable'
+        except requests.RequestException as exc:
+            # Name the failure. 'unreachable' hid an InvalidHeader behind the
+            # same word as a network error.
+            return '', type(exc).__name__
         if resp.status_code != 200:
             return '', resp.status_code
         data = resp.json()
