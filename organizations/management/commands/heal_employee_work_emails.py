@@ -17,8 +17,10 @@ Usage:
     python manage.py heal_employee_work_emails --execute
 """
 import os
+from collections import Counter
 
 import requests
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
@@ -59,9 +61,9 @@ class Command(BaseCommand):
             if not local or local in KEEP_AS_IS:
                 kept.append((profile.work_email, 'keep-as-is'))
                 continue
-            canonical = resolve(shizuha_id_url, local)
+            canonical, status_code = resolve(shizuha_id_url, local)
             if not canonical or canonical.lower() == profile.work_email.lower():
-                unresolved.append((profile.work_email, 'no shizuha-id match'))
+                unresolved.append((profile.work_email, status_code))
                 continue
             changes.append((profile, profile.work_email, canonical))
 
@@ -69,8 +71,16 @@ class Command(BaseCommand):
         self.stdout.write(f"would change: {len(changes)}  kept: {len(kept)}  unresolved: {len(unresolved)}")
         for profile, before, after in changes:
             self.stdout.write(f"  CHANGE {before} -> {after}")
-        for email, reason in kept + unresolved:
+        for email, reason in kept:
             self.stdout.write(f"  SKIP   {email} ({reason})")
+        # A dry-run that resolves nothing must say why. A wall of 401s is an
+        # auth failure, not 33 unknown users.
+        status_counts = Counter(code for _, code in unresolved)
+        for email, code in unresolved:
+            self.stdout.write(f"  SKIP   {email} (shizuha-id HTTP {code})")
+        if status_counts:
+            summary = ', '.join(f"{code}: {n}" for code, n in sorted(status_counts.items()))
+            self.stdout.write(f"unresolved by HTTP status: {summary}")
 
         if not execute:
             self.stdout.write("dry-run: nothing written. Re-run with --execute to apply.")
@@ -82,27 +92,39 @@ class Command(BaseCommand):
                 profile.save(update_fields=['work_email'])
         self.stdout.write(self.style.SUCCESS(f"applied {len(changes)} change(s)"))
 
-    def _canonical_email(self, base_url, username):
-        """The shizuha-id email for a username, or '' when it can't be resolved.
+    def _service_headers(self):
+        """Auth for the admin to shizuha-id hop. The token is never logged.
 
-        shizuha-id exposes ``/internal/users/{id}/`` (see
-        backfill_display_names). These profiles have no linked user id, so the
-        lookup is by username. An unknown username, a non-200, or a transport
-        error leaves the row unresolved rather than guessed.
+        shizuha-id's ``/internal/users/`` list requires an authenticated caller
+        and ignores ``?username=``. The by-username route is the service lookup
+        (``InternalUserByUsernameView``), and it checks
+        ``X-Internal-Service-Token`` against its ``INTERNAL_SERVICE_TOKEN``.
+        """
+        token = str(getattr(settings, 'ADMIN_INTERNAL_SERVICE_TOKEN', '') or '')
+        headers = {'X-Internal-Service': 'shizuha-admin'}
+        if token:
+            headers['X-Internal-Service-Token'] = token
+        return headers
+
+    def _canonical_email(self, base_url, username):
+        """Return ``(email, http_status)`` for a username.
+
+        ``email`` is '' unless shizuha-id returns 200 with an address. The
+        status is returned either way so a dry-run can tell an auth failure
+        (401) from an unknown user (404) instead of reporting both as skipped.
         """
         try:
             resp = requests.get(
-                f'{base_url}/internal/users/',
+                f'{base_url}/internal/users/by-username/',
                 params={'username': username},
+                headers=self._service_headers(),
                 timeout=5,
             )
         except requests.RequestException:
-            return ''
+            return '', 'unreachable'
         if resp.status_code != 200:
-            return ''
+            return '', resp.status_code
         data = resp.json()
-        rows = data if isinstance(data, list) else data.get('results', [data])
-        for row in rows:
-            if isinstance(row, dict) and (row.get('username') or '').lower() == username:
-                return (row.get('email') or '').strip()
-        return ''
+        if isinstance(data, dict) and (data.get('username') or '').lower() == username:
+            return (data.get('email') or '').strip(), 200
+        return '', 200
