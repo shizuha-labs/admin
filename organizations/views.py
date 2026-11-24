@@ -733,6 +733,13 @@ class JITElevatedAccessGrantView(APIView):
                     actor_email=f'policy:{policy_slug}', decided_at=d,
                 )
             )
+        else:
+            # PLAT-13342: a pending grant notified nobody until a decision
+            # landed, so one with no online approver aged silently. Tell the
+            # owning-team lead at mint time. Fail-soft and idempotent.
+            transaction.on_commit(
+                lambda g=grant: jit_notifications.emit_jit_pending_notification(grant=g)
+            )
 
         return Response({
             'auto_approved': auto_approved,

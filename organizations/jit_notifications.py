@@ -147,6 +147,33 @@ def _post_system_message(
     return True
 
 
+def emit_jit_pending_notification(*, grant) -> bool:
+    """Tell the owning-team lead a grant is waiting, at mint time.
+
+    PLAT-13342: a pending grant only notified anyone once a decision landed,
+    so a grant whose approver team had nobody online aged silently until its
+    TTL. This fires once, when the grant is minted and not auto-approved, to
+    the owning-team lead. Idempotent per grant: the deterministic
+    ``client_message_id`` collapses a replayed mint onto one message. Never
+    raises; a grant with no resolvable lead emits nothing.
+    """
+    if not bool(getattr(settings, 'JIT_DECISION_NOTIFICATIONS_ENABLED', True)):
+        return False
+    lead_id = _resolve_team_lead_user_id(grant)
+    if lead_id is None:
+        return False
+    content = jit_decision_content(
+        grant=grant, decision='pending', actor='mint',
+        decided_at=getattr(grant, 'created_at', None),
+        note='Awaiting an entitled approver on the owning team.',
+    )
+    namespace = uuid.UUID('9f2b1c3e-6a57-4d0e-9b8a-1c2d3e4f5a6b')
+    client_message_id = str(uuid.uuid5(namespace, f'{grant.pk}|pending|{lead_id}'))
+    return _post_system_message(
+        recipient_user_id=lead_id, content=content, client_message_id=client_message_id,
+    )
+
+
 def emit_jit_decision_notification(
     *, grant, decision: str, actor_email: str = '', decided_at=None, note: str = '',
 ) -> bool:

@@ -216,6 +216,42 @@ class NotifyExpiredJitGrantsTaskTests(TestCase):
         post.assert_not_called()
 
 
+class JitPendingNotificationTests(TestCase):
+    """PLAT-13342: a pending grant tells its owning-team lead at mint time."""
+
+    def setUp(self):
+        self.org = _org()
+        self.team = _team(self.org, lead_id=7)
+        self.grant = _grant(self.org)
+
+    def test_pending_grant_notifies_the_owning_team_lead(self):
+        with mock.patch.object(jit_notifications.requests, 'post',
+                               return_value=_accepted_response()) as post:
+            ok = jit_notifications.emit_jit_pending_notification(grant=self.grant)
+        self.assertTrue(ok)
+        self.assertEqual(post.call_count, 1)
+        body = post.call_args.kwargs['json']
+        self.assertEqual(body['recipient_user_id'], 7)
+        self.assertIn('decision: pending', body['content'])
+        self.assertIn(f'grant_id: {self.grant.pk}', body['content'])
+
+    def test_pending_notice_is_idempotent(self):
+        with mock.patch.object(jit_notifications.requests, 'post',
+                               return_value=_accepted_response()) as post:
+            jit_notifications.emit_jit_pending_notification(grant=self.grant)
+            jit_notifications.emit_jit_pending_notification(grant=self.grant)
+        ids = {call.kwargs['json']['client_message_id'] for call in post.call_args_list}
+        self.assertEqual(len(ids), 1)
+
+    def test_no_lead_emits_nothing(self):
+        self.team.lead_id = None
+        self.team.save()
+        with mock.patch.object(jit_notifications.requests, 'post') as post:
+            ok = jit_notifications.emit_jit_pending_notification(grant=self.grant)
+        self.assertFalse(ok)
+        post.assert_not_called()
+
+
 def JITElevatedAccessGrantEvent_marker_exists(grant) -> bool:
     from organizations.models import JITElevatedAccessGrantEvent
     return JITElevatedAccessGrantEvent.objects.filter(
